@@ -1,0 +1,71 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="contourpy" />
+          <option value="cycler" />
+          <option value="filelock" />
+          <option value="fonttools" />
+          <option value="fsspec" />
+          <option value="fvcore" />
+          <option value="iopath" />
+          <option value="kiwisolver" />
+          <option value="matplotlib" />
+          <option value="mpmath" />
+          <option value="networkx" />
+          <option value="numpy" />
+          <option value="pandas" />
+          <option value="pillow" />
+          <option value="portalocker" />
+          <option value="pyparsing" />
+          <option value="pywin32" />
+          <option value="PyYAML" />
+          <option value="setuptools" />
+          <option value="sympy" />
+          <option value="tabulate" />
+          <option value="termcolor" />
+          <option value="thop" />
+          <option value="torch" />
+          <option value="tqdm" />
+          <option value="tzdata" />
+          <option value="yacs" />
+          <option value="langgraph" />
+          <option value="langchain" />
+          <option value="langchain-core" />
+          <option value="langchain-openai" />
+          <option value="langchain-anthropic" />
+          <option value="langchain-sandbox" />
+          <option value="langgraph_bigtool" />
+          <option value="langchain_community" />
+          <option value="langgraph_supervisor" />
+          <option value="langgraph_swarm" />
+          <option value="langgraph-checkpoint" />
+          <option value="aiohttp" />
+          <option value="anthropic" />
+          <option value="Pygments" />
+          <option value="pydantic" />
+          <option value="httpx" />
+          <option value="rich" />
+          <option value="jupyter" />
+          <option value="ipykernel" />
+          <option value="colorama" />
+          <option value="Jinja2" />
+          <option value="MarkupSafe" />
+          <option value="packaging" />
+          <option value="python-dateutil" />
+          <option value="six" />
+          <option value="typing_extensions" />
+        </list>
+      </option>
+    </inspection_tool>
+    <inspection_tool class="PyStubPackagesAdvertiser" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="pandas" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
