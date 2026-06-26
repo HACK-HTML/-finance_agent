@@ -45,7 +45,7 @@ class RAGConfig:
 
     # 模型
     embed_model: str = field(
-        default_factory=lambda: os.getenv("RAG_EMBED_MODEL", "BAAI/bge-base-zh-v1.5")
+        default_factory=lambda: os.getenv("RAG_EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
     )
     rerank_model: str = field(
         default_factory=lambda: os.getenv("RAG_RERANK_MODEL", "BAAI/bge-reranker-base")
@@ -87,8 +87,8 @@ def _clean_text(text: str) -> str:
 
 
 # ── 2. 递归切块（优先在语义边界切 + 重叠窗口）────────────────────────────────────
-# 分隔符按「语义强度」从强到弱排列：段落 > 换行 > 英文句子 > 中文句子 > 分号 > 空格
-_SEPARATORS = ["\n\n", "\n", ".", "!", "?", "。", "！", ";", "；", " ", ""]
+# 分隔符按「语义强度」从强到弱排列：段落 > 换行 > 中文句号 > 英文句号 > 分号 > 空格
+_SEPARATORS = ["\n\n", "\n", "。", "！", "？", ".", "！", ";", "；", " ", ""]
 
 
 def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
@@ -211,6 +211,23 @@ class RetrievedChunk:
     score: float
 
 
+def _build_qdrant_client(loc: str) -> QdrantClient:
+    """
+    根据 qdrant_location 的形态选择正确的连接方式：
+      - ":memory:"            → 纯内存（测试用）
+      - "http://..."/"https://" → 远程 Qdrant 服务（生产）
+      - 其它（本地路径）        → 本地嵌入式持久化（path=，关掉重开数据还在）
+
+    ⚠️ 坑：qdrant-client 的 location= 只接受 ":memory:" 或远程 URL；
+    本地磁盘路径必须用 path=，否则会被当成远程地址去连，报 WinError 10054。
+    """
+    if loc == ":memory:":
+        return QdrantClient(location=":memory:")
+    if loc.startswith("http://") or loc.startswith("https://"):
+        return QdrantClient(url=loc)
+    return QdrantClient(path=loc)   # 本地路径 → 嵌入式持久化
+
+
 class DocumentStore:
     """
     一个进程内单例就够用（见文件底部 get_store()）。
@@ -219,7 +236,7 @@ class DocumentStore:
 
     def __init__(self, config: Optional[RAGConfig] = None):
         self.cfg = config or RAGConfig()
-        self.client = QdrantClient(location=self.cfg.qdrant_location)
+        self.client = _build_qdrant_client(self.cfg.qdrant_location)
         self.embedder = _Embedder(self.cfg.embed_model, self.cfg.query_instruction)
         self.reranker = _Reranker(self.cfg.rerank_model)
         self._lock = threading.Lock()
@@ -261,6 +278,11 @@ class DocumentStore:
     def _upsert(self, records: list[tuple[str, int]], session_id: str, doc_name: str) -> dict:
         with self._lock:
             self._ensure_collection()
+
+            # ★ 幂等：同一会话内重传同名文档 = 替换。先删掉该 (session_id, source) 的旧 chunk，
+            #   避免同样内容堆积成多份、污染检索（top_n 被重复副本占满）。
+            replaced = self._delete_by_source(session_id, doc_name)
+
             texts = [r[0] for r in records]
             vectors = self.embedder.embed_passages(texts)
             points = [
@@ -277,7 +299,21 @@ class DocumentStore:
                 for (text, page), vec in zip(records, vectors)
             ]
             self.client.upsert(self.cfg.collection_name, points=points)
-        return {"doc_name": doc_name, "chunks": len(points)}
+        return {"doc_name": doc_name, "chunks": len(points), "replaced_old_chunks": replaced}
+
+    def _delete_by_source(self, session_id: str, doc_name: str) -> int:
+        """删除某会话下某文档已有的全部 chunk，返回删除前的数量（无则 0）。"""
+        if not self.client.collection_exists(self.cfg.collection_name):
+            return 0
+        flt = models.Filter(must=[
+            models.FieldCondition(key="session_id", match=models.MatchValue(value=session_id)),
+            models.FieldCondition(key="source", match=models.MatchValue(value=doc_name)),
+        ])
+        existed = self.client.count(self.cfg.collection_name, count_filter=flt).count
+        if existed:
+            self.client.delete(self.cfg.collection_name,
+                               points_selector=models.FilterSelector(filter=flt))
+        return existed
 
     # —— 检索（两阶段）——
     def retrieve(self, query: str, session_id: str = "default",
