@@ -8,7 +8,7 @@ import json
 import anthropic
 import asyncio
 from models.schemas import AgentState, ToolCall, ToolResult, ConversationTurn, MonthlyReport
-from tools.registry import TOOL_REGISTRY, TOOL_SCHEMAS,generate_budget_plan
+from tools.registry import TOOL_REGISTRY, TOOL_SCHEMAS, generate_budget_plan, retrieve_document
 
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
@@ -22,6 +22,7 @@ SYSTEM_PROMPT = f"""你是一个专业的个人财务分析助手。你能帮用
 - 分析收支数据，计算关键指标（储蓄率、消费占比等）
 - 查询实时汇率或模拟股票数据
 - 制定预算方案并评估财务健康度
+- 阅读并检索用户上传的财务文档（理财产品说明书 / 账单 / 年报等），回答文档相关问题
 - 多轮追问，持续深入分析
 - 当用户请求月度报告时，输出符合以下 JSON Schema 的内容：{MonthlyReport.model_json_schema()}
 - 当用户请求制定预算方案时，
@@ -30,20 +31,27 @@ SYSTEM_PROMPT = f"""你是一个专业的个人财务分析助手。你能帮用
 1. 先思考需要哪些信息，再决定调用哪个工具
 2. 工具返回结果后，判断是否需要继续调用或可以给出最终答案
 3. 数字计算必须使用 calculate 工具，不要心算
-4. 回答要具体，给出可操作的建议
+4. 当问题的答案依赖用户上传的具体文档内容（如某产品的费率、合同条款、年报数据、
+   账单明细）时，调用 retrieve_document 检索原文，并基于检索结果作答、标注来源；
+   检索片段中没有的信息不要编造。纯计算 / 实时行情 / 通用常识则用对应工具或直接回答，
+   不要滥用文档检索。
+5. 回答要具体，给出可操作的建议
 """
 
 
 # ── ReAct 核心循环 ────────────────────────────────────────────────────────────
 class FinanceAgent:
-    def __init__(self):
+    def __init__(self, session_id: str = "default"):
+        self.session_id = session_id          # ★ 用于把文档检索限定在本会话的文档范围内
         self.client = anthropic.Anthropic(api_key=API_KEY,base_url=BASE_URL)
         self.state = AgentState()
         self._critic=anthropic.Anthropic(api_key=API_CRITIC_KEY,base_url=BASE_URL)
-        # 注册表：预算工具预先绑定 _client，其余工具原样
+        # 注册表：预算工具预先绑定 _client，检索工具预先绑定 session_id，其余工具原样
         self.tool_registry = {
             **TOOL_REGISTRY,  # 其他工具
             "generate_budget_plan": partial(generate_budget_plan, _client=self._critic),
+            # ★ session_id 是隐藏参数，不进 schema、不暴露给 LLM，由 partial 绑定
+            "retrieve_document": partial(retrieve_document, session_id=self.session_id),
         }
 
     async def chat(self, user_input: str) -> str:

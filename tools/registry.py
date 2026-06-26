@@ -11,6 +11,8 @@ from datetime import datetime
 from typing import Callable, Any
 from models.schemas import BudgetCritique
 from tools.budget_plan import _initial_ratios, _compute_plan, _critique_plan, _render_plan
+# ★ Week1 Day1-2：把 Agentic RAG 检索作为标准工具接入
+from tools.retrieve_tool import retrieve_document, RETRIEVE_DOCUMENT_SCHEMA
 
 
 # ── 1. 财务计算工具 ────────────────────────────────────────────────────────────
@@ -271,214 +273,209 @@ TOOL_REGISTRY: dict[str, Callable[...,Any]] = {
     "generate_budget_plan":    generate_budget_plan,
     "get_exchange_rate":       get_exchange_rate,
     "get_fund_info":           get_fund_info,
+    "retrieve_document":       retrieve_document,   # ★ 新增：文档检索工具
 }
 
 
 # ── 4. 工具 Schema（告诉 Claude 每个工具的签名和用途）────────────────────────────
 # 这是 Anthropic Function Calling 的关键：描述越清晰，Agent 调用越准确
 
-TOOL_SCHEMAS = [
+TOOL_SCHEMAS = [{
+    "name": "calculate",
+    "description": "执行精确的纯数值数学计算。触发时机：当需要进行任何金额核算、比例计算或多步加减乘除时，必须调用此工具，绝对禁止模型自行心算。负向约束：仅支持纯数字与基础运算符(+, -, *, /, (), **)，严禁传入任何字母、变量名、等号(=)或编程语言内置函数。注意：绝对不要在表达式中包含 '计算' 或 'x=' 等非数学字符。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "expression": {
+                "type": "string",
+                "description": "需要计算的纯数学表达式。必须是可以直接被数学引擎解析的算式。",
+                "pattern": "^[0-9+\\-*/().\\s]+$"
+            }
+        },
+        "required": ["expression"]
+    },
+    "input_examples": [
+        {
+            "expression": "(5000 - 3200) / 5000"
+        },
+        {
+            "expression": "1200 * 12.5"
+        },
+        {
+            "expression": "10000 * (1 + 0.05) ** 3"
+        }
+    ]
+}, {
+    "name": "analyze_expenses",
+    "description": "分析一组交易数据，输出分类汇总、储蓄率、支出排行等关键指标。触发时机：当用户提供了多笔交易明细、询问消费结构或某段时间的收支概况时调用。负向约束：绝对禁止模型自行对交易数据做分类汇总或心算储蓄率，必须通过此工具完成；transactions_json 必须是合法的 JSON 数组字符串，空数组或格式错误将被拒绝。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "transactions_json": {
+                "type": "string",
+                "description": "JSON 数组字符串。每项含 category(消费分类)、amount(正数=支出/负数=收入)、description(备注)。",
+                "pattern": "^\\s*\\[.*\\]\\s*$"
+            },
+            "period": {
+                "type": "string",
+                "description": "分析周期描述，如 '2024年12月' 或 '本月'",
+                "default": "本月"
+            }
+        },
+        "required": ["transactions_json"]
+    },
+    "input_examples": [
+        {
+            "transactions_json": "[{\"category\":\"餐饮\",\"amount\":500,\"description\":\"周末聚餐\"},{\"category\":\"交通\",\"amount\":200,\"description\":\"地铁充值\"},{\"category\":\"工资\",\"amount\":-8000,\"description\":\"月薪\"}]",
+            "period": "2024年12月"
+        },
+        {
+            "transactions_json": "[{\"category\":\"娱乐\",\"amount\":300},{\"category\":\"购物\",\"amount\":1200,\"description\":\"衣服\"}]"
+        }
+    ]
+}, {
+    "name": "evaluate_financial_health",
+    "description": "根据收支和储蓄情况评估财务健康度，输出 1-100 评分、等级和具体改善建议。触发时机：当用户询问自己的财务状况是否健康、风险评估、或想知道哪些方面需要改进时调用。负向约束：绝对禁止模型自行打分或编造评估结论，必须通过此工具基于 50/30/20 法则、储蓄率基准、债务收入比等标准指标进行客观评估；所有金额参数必须为正数。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "monthly_income": {
+                "type": "number",
+                "description": "月收入（税后到手），单位：元",
+                "minimum": 0
+            },
+            "monthly_expense": {
+                "type": "number",
+                "description": "月总支出（含所有日常开销与固定支出），单位：元",
+                "minimum": 0
+            },
+            "total_savings": {
+                "type": "number",
+                "description": "当前总储蓄 / 可随时调用的应急资金总额，单位：元",
+                "minimum": 0
+            },
+            "monthly_debt_payment": {
+                "type": "number",
+                "description": "每月债务还款总额（房贷、车贷、信用卡分期等），无债务填 0",
+                "default": 0,
+                "minimum": 0
+            }
+        },
+        "required": ["monthly_income", "monthly_expense", "total_savings"]
+    },
+    "input_examples": [
+        {
+            "monthly_income": 15000,
+            "monthly_expense": 12000,
+            "total_savings": 50000,
+            "monthly_debt_payment": 2000
+        },
+        {
+            "monthly_income": 8000,
+            "monthly_expense": 7500,
+            "total_savings": 10000
+        }
+    ]
+}, {
+    "name": "generate_budget_plan",
+    "description": "根据月收入和财务目标，基于 50/30/20 法则生成个性化预算分配方案。触发时机：当用户需要预算规划、收入分配建议、制定省钱/还债/投资计划时调用。负向约束：绝对禁止模型自行计算或估算预算分配比例，必须通过此工具动态生成；financial_goal 必须从预设选项中选取，monthly_income 必须为正数。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "monthly_income": {
+                "type": "number",
+                "description": "月收入（税后到手），单位：元",
+                "minimum": 0
+            },
+            "financial_goal": {
+                "type": "string",
+                "description": "核心财务目标，系统将据此动态调整预算分配策略（激进储蓄型 / 还债优先型 / 均衡发展型）",
+                "enum": ["买房", "存钱", "储蓄", "还债", "债务", "平衡储蓄与生活质量"]
+            },
+            "current_obligations": {
+                "type": "string",
+                "description": "当前固定支出或债务说明，如 '房租2000+车贷1500'，无则留空",
+                "default": ""
+            }
+        },
+        "required": ["monthly_income"]
+    },
+    "input_examples": [
+        {
+            "monthly_income": 12000,
+            "financial_goal": "买房",
+            "current_obligations": "房租2500"
+        },
+        {
+            "monthly_income": 9000,
+            "financial_goal": "平衡储蓄与生活质量"
+        },
+        {
+            "monthly_income": 15000,
+            "financial_goal": "还债",
+            "current_obligations": "房贷4000+车贷1500"
+        }
+    ]
+}, {
+    "name": "get_exchange_rate",
+    "description": "查询两种货币之间的实时汇率（当前为模拟数据）。触发时机：当用户需要进行货币换算、外币资产估值、跨境消费金额转换时调用。负向约束：绝对禁止模型自行估算或猜测汇率数值，必须通过此工具查询；仅支持系统中预定义的货币代码（USD/CNY/EUR/JPY/HKD/GBP），不支持的货币对将返回错误。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "from_currency": {
+                "type": "string",
+                "description": "源货币的三位 ISO 字母代码",
+                "pattern": "^[A-Z]{3}$",
+                "enum": ["USD", "CNY", "EUR", "JPY", "HKD", "GBP"]
+            },
+            "to_currency": {
+                "type": "string",
+                "description": "目标货币的三位 ISO 字母代码",
+                "pattern": "^[A-Z]{3}$",
+                "enum": ["USD", "CNY", "EUR", "JPY", "HKD", "GBP"]
+            }
+        },
+        "required": ["from_currency", "to_currency"]
+    },
+    "input_examples": [
+        {
+            "from_currency": "USD",
+            "to_currency": "CNY"
+        },
+        {
+            "from_currency": "CNY",
+            "to_currency": "JPY"
+        },
+        {
+            "from_currency": "EUR",
+            "to_currency": "USD"
+        }
+    ]
+}, {
+    "name": "get_fund_info",
+    "description": "查询基金或股票的基本信息（净值、年初至今收益、风险等级），当前为模拟数据。触发时机：当用户询问某只基金/股票的表现、需要投资参考数据、或想了解特定标的的基本面时调用。负向约束：绝对禁止模型自行编造或猜测基金的净值、涨跌幅、风险等级等数据，必须通过此工具查询；仅支持系统中已录入的代码，不支持的代码将返回未找到提示。⚠️ 所有数据均为模拟，不构成投资建议。",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "fund_code": {
+                "type": "string",
+                "description": "基金或股票代码",
+                "enum": ["000001", "110022", "SPY", "QQQ"]
+            }
+        },
+        "required": ["fund_code"]
+    },
+    "input_examples": [
+        {
+            "fund_code": "000001"
+        },
+        {
+            "fund_code": "SPY"
+        },
+        {
+            "fund_code": "110022"
+        }
+    ]
+}, RETRIEVE_DOCUMENT_SCHEMA]
 
-    {
-        "name": "calculate",
-        "description": "执行精确的纯数值数学计算。触发时机：当需要进行任何金额核算、比例计算或多步加减乘除时，必须调用此工具，绝对禁止模型自行心算。负向约束：仅支持纯数字与基础运算符(+, -, *, /, (), **)，严禁传入任何字母、变量名、等号(=)或编程语言内置函数。注意：绝对不要在表达式中包含 '计算' 或 'x=' 等非数学字符。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "需要计算的纯数学表达式。必须是可以直接被数学引擎解析的算式。",
-                    "pattern": "^[0-9+\\-*/().\\s]+$"
-                }
-            },
-            "required": ["expression"]
-        },
-        "input_examples": [
-            {
-                "expression": "(5000 - 3200) / 5000"
-            },
-            {
-                "expression": "1200 * 12.5"
-            },
-            {
-                "expression": "10000 * (1 + 0.05) ** 3"
-            }
-        ]
-    },
-    {
-        "name": "analyze_expenses",
-        "description": "分析一组交易数据，输出分类汇总、储蓄率、支出排行等关键指标。触发时机：当用户提供了多笔交易明细、询问消费结构或某段时间的收支概况时调用。负向约束：绝对禁止模型自行对交易数据做分类汇总或心算储蓄率，必须通过此工具完成；transactions_json 必须是合法的 JSON 数组字符串，空数组或格式错误将被拒绝。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "transactions_json": {
-                    "type": "string",
-                    "description": "JSON 数组字符串。每项含 category(消费分类)、amount(正数=支出/负数=收入)、description(备注)。",
-                    "pattern": "^\\s*\\[.*\\]\\s*$"
-                },
-                "period": {
-                    "type": "string",
-                    "description": "分析周期描述，如 '2024年12月' 或 '本月'",
-                    "default": "本月"
-                }
-            },
-            "required": ["transactions_json"]
-        },
-        "input_examples": [
-            {
-                "transactions_json": "[{\"category\":\"餐饮\",\"amount\":500,\"description\":\"周末聚餐\"},{\"category\":\"交通\",\"amount\":200,\"description\":\"地铁充值\"},{\"category\":\"工资\",\"amount\":-8000,\"description\":\"月薪\"}]",
-                "period": "2024年12月"
-            },
-            {
-                "transactions_json": "[{\"category\":\"娱乐\",\"amount\":300},{\"category\":\"购物\",\"amount\":1200,\"description\":\"衣服\"}]"
-            }
-        ]
-    },
-    {
-        "name": "evaluate_financial_health",
-        "description": "根据收支和储蓄情况评估财务健康度，输出 1-100 评分、等级和具体改善建议。触发时机：当用户询问自己的财务状况是否健康、风险评估、或想知道哪些方面需要改进时调用。负向约束：绝对禁止模型自行打分或编造评估结论，必须通过此工具基于 50/30/20 法则、储蓄率基准、债务收入比等标准指标进行客观评估；所有金额参数必须为正数。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "monthly_income": {
-                    "type": "number",
-                    "description": "月收入（税后到手），单位：元",
-                    "minimum": 0
-                },
-                "monthly_expense": {
-                    "type": "number",
-                    "description": "月总支出（含所有日常开销与固定支出），单位：元",
-                    "minimum": 0
-                },
-                "total_savings": {
-                    "type": "number",
-                    "description": "当前总储蓄 / 可随时调用的应急资金总额，单位：元",
-                    "minimum": 0
-                },
-                "monthly_debt_payment": {
-                    "type": "number",
-                    "description": "每月债务还款总额（房贷、车贷、信用卡分期等），无债务填 0",
-                    "default": 0,
-                    "minimum": 0
-                }
-            },
-            "required": ["monthly_income", "monthly_expense", "total_savings"]
-        },
-        "input_examples": [
-            {
-                "monthly_income": 15000,
-                "monthly_expense": 12000,
-                "total_savings": 50000,
-                "monthly_debt_payment": 2000
-            },
-            {
-                "monthly_income": 8000,
-                "monthly_expense": 7500,
-                "total_savings": 10000
-            }
-        ]
-    },
-    {
-        "name": "generate_budget_plan",
-        "description": "根据月收入和财务目标，基于 50/30/20 法则生成个性化预算分配方案。触发时机：当用户需要预算规划、收入分配建议、制定省钱/还债/投资计划时调用。负向约束：绝对禁止模型自行计算或估算预算分配比例，必须通过此工具动态生成；financial_goal 必须从预设选项中选取，monthly_income 必须为正数。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "monthly_income": {
-                    "type": "number",
-                    "description": "月收入（税后到手），单位：元",
-                    "minimum": 0
-                },
-                "financial_goal": {
-                    "type": "string",
-                    "description": "核心财务目标，系统将据此动态调整预算分配策略（激进储蓄型 / 还债优先型 / 均衡发展型）",
-                    "enum": ["买房", "存钱", "储蓄", "还债", "债务", "平衡储蓄与生活质量"]
-                },
-                "current_obligations": {
-                    "type": "string",
-                    "description": "当前固定支出或债务说明，如 '房租2000+车贷1500'，无则留空",
-                    "default": ""
-                }
-            },
-            "required": ["monthly_income"]
-        },
-        "input_examples": [
-            {
-                "monthly_income": 12000,
-                "financial_goal": "买房",
-                "current_obligations": "房租2500"
-            },
-            {
-                "monthly_income": 9000,
-                "financial_goal": "平衡储蓄与生活质量"
-            },
-            {
-                "monthly_income": 15000,
-                "financial_goal": "还债",
-                "current_obligations": "房贷4000+车贷1500"
-            }
-        ]
-    },
-    {
-        "name": "get_exchange_rate",
-        "description": "查询两种货币之间的实时汇率（当前为模拟数据）。触发时机：当用户需要进行货币换算、外币资产估值、跨境消费金额转换时调用。负向约束：绝对禁止模型自行估算或猜测汇率数值，必须通过此工具查询；仅支持系统中预定义的货币代码（USD/CNY/EUR/JPY/HKD/GBP），不支持的货币对将返回错误。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "from_currency": {
-                    "type": "string",
-                    "description": "源货币的三位 ISO 字母代码",
-                    "pattern": "^[A-Z]{3}$",
-                    "enum": ["USD", "CNY", "EUR", "JPY", "HKD", "GBP"]
-                },
-                "to_currency": {
-                    "type": "string",
-                    "description": "目标货币的三位 ISO 字母代码",
-                    "pattern": "^[A-Z]{3}$",
-                    "enum": ["USD", "CNY", "EUR", "JPY", "HKD", "GBP"]
-                }
-            },
-            "required": ["from_currency", "to_currency"]
-        },
-        "input_examples": [
-            {
-                "from_currency": "USD",
-                "to_currency": "CNY"
-            },
-            {
-                "from_currency": "CNY",
-                "to_currency": "JPY"
-            },
-            {
-                "from_currency": "EUR",
-                "to_currency": "USD"
-            }
-        ]
-    },
-    {
-        "name": "get_fund_info",
-        "description": "查询基金或股票的基本信息（净值、年初至今收益、风险等级），当前为模拟数据。触发时机：当用户询问某只基金/股票的表现、需要投资参考数据、或想了解特定标的的基本面时调用。负向约束：绝对禁止模型自行编造或猜测基金的净值、涨跌幅、风险等级等数据，必须通过此工具查询；仅支持系统中已录入的代码，不支持的代码将返回未找到提示。⚠️ 所有数据均为模拟，不构成投资建议。",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "fund_code": {
-                    "type": "string",
-                    "description": "基金或股票代码",
-                    "enum": ["000001", "110022", "SPY", "QQQ"]
-                }
-            },
-            "required": ["fund_code"]
-        },
-        "input_examples": [
-            {
-                "fund_code": "000001"
-            },
-            {
-                "fund_code": "SPY"
-            },
-            {
-                "fund_code": "110022"
-            }
-        ]
-    },
-]
+# ★ Week1 Day1-2：把文档检索工具的 schema 也告诉 Claude

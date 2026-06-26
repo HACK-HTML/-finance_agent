@@ -17,6 +17,7 @@ WELCOME = """
 ╚══════════════════════════════════════════════════════╝
 
 命令：
+  /upload <PDF路径> — 上传财务文档进知识库（之后可直接提问文档内容）
   /reset   — 重置对话历史
   /stats   — 查看本次会话统计
   /demo    — 运行一组演示问题
@@ -79,6 +80,19 @@ async def main():
             continue
         elif user_input == "/demo":
             run_demo(agent)
+            continue
+        elif user_input.startswith("/upload"):
+            parts = user_input.split(maxsplit=1)
+            if len(parts) < 2:
+                print("用法：/upload <PDF文件路径>")
+                continue
+            from tools.rag_pipeline import get_store
+            path = parts[1].strip().strip('"').strip("'")
+            try:
+                stats = get_store().ingest_pdf(path, session_id=agent.session_id)
+                print(f"✅ 文档已入库：{stats}")
+            except Exception as e:
+                print(f"❌ 入库失败：{e}")
             continue
 
         # 正常对话

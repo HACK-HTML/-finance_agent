@@ -4,7 +4,11 @@ FastAPI 服务 — 把 Agent 包装成 HTTP API
 """
 
 import uuid
-from fastapi import FastAPI, HTTPException
+import os
+import shutil
+import asyncio
+import tempfile
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
@@ -15,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.agent import FinanceAgent
+from tools.rag_pipeline import get_store
 
 app = FastAPI(
     title="💰 个人财务 Agent API",
@@ -60,22 +65,22 @@ def root():
 
 
 @app.post("/chat", response_model=ChatResponse, summary="发送消息给 Agent")
-def chat(req: ChatRequest):
+async def chat(req: ChatRequest):
     """
     主要对话接口。
     - session_id 不传时自动创建新会话
-    - 同一 session_id 保持多轮对话记忆
+    - 同一 session_id 保持多轮对话记忆，并把文档检索限定在该会话上传的文档内
     """
     # 获取或创建会话
     sid = req.session_id or str(uuid.uuid4())
     if sid not in sessions:
-        sessions[sid] = FinanceAgent()
+        sessions[sid] = FinanceAgent(session_id=sid)   # ★ 把会话 id 传进去
         print(f"[新会话] {sid}")
 
     agent = sessions[sid]
 
-    # 执行 ReAct 循环
-    reply = agent.chat(req.message)
+    # 执行 ReAct 循环（chat 是 async，必须 await）
+    reply = await agent.chat(req.message)
 
     return ChatResponse(
         session_id=sid,
@@ -83,6 +88,32 @@ def chat(req: ChatRequest):
         turn_count=agent.state.turn_count,
         tool_calls_used=agent.state.total_tool_calls,
     )
+
+
+@app.post("/upload", summary="上传 PDF 文档进入指定会话的知识库")
+async def upload(file: UploadFile = File(...), session_id: str | None = Form(None)):
+    """
+    用户上传 PDF → 切块 + 向量化 → 写入该会话的 Qdrant 知识库。
+    之后同一 session_id 的对话里，Agent 即可用 retrieve_document 检索这份文档。
+    """
+    sid = session_id or str(uuid.uuid4())
+    if sid not in sessions:
+        sessions[sid] = FinanceAgent(session_id=sid)
+
+    # 落到临时文件再交给 ingest（pypdf 需要文件路径）
+    suffix = os.path.splitext(file.filename or "doc.pdf")[1] or ".pdf"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+    try:
+        # ingest 是同步且较重（模型推理），丢到线程池避免阻塞事件循环
+        stats = await asyncio.to_thread(
+            get_store().ingest_pdf, tmp_path, sid, file.filename
+        )
+    finally:
+        os.unlink(tmp_path)
+
+    return {"session_id": sid, "message": "✅ 文档已入库，可以开始提问", **stats}
 
 
 @app.get("/session/{session_id}", response_model=SessionInfo, summary="查看会话详情")
