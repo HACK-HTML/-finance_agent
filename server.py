@@ -113,7 +113,15 @@ async def upload(file: UploadFile = File(...), session_id: str | None = Form(Non
     finally:
         os.unlink(tmp_path)
 
-    return {"session_id": sid, "message": "✅ 文档已入库，可以开始提问", **stats}
+    # replaced_old_chunks > 0 说明同名文档已存在，本次为「替换」而非「新增」
+    replaced = stats.get("replaced_old_chunks", 0)
+    if replaced:
+        message = (f"♻️ 检测到重复上传，已用新版本替换旧文档"
+                   f"（清理旧片段 {replaced} 块，写入新片段 {stats['chunks']} 块）")
+    else:
+        message = f"✅ 文档已入库（{stats['chunks']} 块），可以开始提问"
+
+    return {"session_id": sid, "message": message, **stats}
 
 
 @app.get("/session/{session_id}", response_model=SessionInfo, summary="查看会话详情")

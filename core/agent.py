@@ -12,7 +12,7 @@ from tools.registry import TOOL_REGISTRY, TOOL_SCHEMAS, generate_budget_plan, re
 
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
-API_KEY='sk-9f690eab2b2340cdaf451dde1746830d'
+API_KEY='sk-93ff6c0d529d447596cc0da70ff18ca4'
 API_CRITIC_KEY='sk-33d367956a054b1c8f5870667ff821d6'
 
 MODEL='deepseek-v4-pro'
@@ -25,10 +25,11 @@ SYSTEM_PROMPT = f"""你是一个专业的个人财务分析助手。你能帮用
 - 阅读并检索用户上传的财务文档（理财产品说明书 / 账单 / 年报等），回答文档相关问题
 - 多轮追问，持续深入分析
 - 当用户请求月度报告时，输出符合以下 JSON Schema 的内容：{MonthlyReport.model_json_schema()}
-- 当用户请求制定预算方案时，
+
+
 
 工作原则：
-1. 先思考需要哪些信息，再决定调用哪个工具
+1. 先思考需要哪些信息，再决定调用哪个工具，严格参照Tool Schemas调用工具
 2. 工具返回结果后，判断是否需要继续调用或可以给出最终答案
 3. 数字计算必须使用 calculate 工具，不要心算
 4. 当问题的答案依赖用户上传的具体文档内容（如某产品的费率、合同条款、年报数据、
@@ -119,51 +120,6 @@ class FinanceAgent:
 
         return "已达到最大推理轮数，请简化问题后重试。"
 
-
-    """def _execute_tools(self, content_blocks: list) -> list[dict]:
-        """"""
-        遍历 Claude 响应中的所有 tool_use 块，逐一执行。
-        返回格式符合 Anthropic API 规范的 tool_result 列表。
-        """"""
-        tool_results = []
-
-        for block in content_blocks:
-            if block.type != "tool_use":
-                continue
-
-            tool_call = ToolCall(
-                tool_use_id=block.id,
-                tool_name=block.name,
-                tool_input=block.input,
-            )
-
-            print(f"[工具调用] {block.name}({json.dumps(block.input, ensure_ascii=False)})")
-
-            # 查找工具函数并执行
-            tool_fn = TOOL_REGISTRY.get(block.name)
-            if tool_fn is None:
-                result_content = f"错误：工具 '{block.name}' 未注册"
-            else:
-                try:
-                    result_content = tool_fn(**block.input)
-                except Exception as e:
-                    result_content = f"工具执行出错：{str(e)}"
-
-            print(f"[工具结果] {str(result_content)[:200]}")
-
-            # 记录工具调用历史
-            self.state.tool_history.append(
-                ToolResult(tool_call=tool_call, result=str(result_content))
-            )
-
-            # 构建符合 API 规范的 tool_result 块
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": str(result_content),
-            })
-
-        return tool_results"""
 
     async def _execute_single_tool(self, block) -> tuple[ToolCall, str]:
         """执行单个工具调用，返回 (调用记录, 结果字符串)。永不抛异常。"""
