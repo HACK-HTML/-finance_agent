@@ -219,7 +219,11 @@ class DocumentStore:
 
     def __init__(self, config: Optional[RAGConfig] = None):
         self.cfg = config or RAGConfig()
-        self.client = QdrantClient(location=self.cfg.qdrant_location)
+        # qdrant-client ≥1.9: 本地文件存储用 path=，location=":memory:" 走内存
+        if self.cfg.qdrant_location == ":memory:":
+            self.client = QdrantClient(location=":memory:")
+        else:
+            self.client = QdrantClient(path=self.cfg.qdrant_location)
         self.embedder = _Embedder(self.cfg.embed_model, self.cfg.query_instruction)
         self.reranker = _Reranker(self.cfg.rerank_model)
         self._lock = threading.Lock()

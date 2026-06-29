@@ -50,7 +50,7 @@ class FinanceAgent:
         self.client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL)
         self.state = AgentState()
         self._critic = anthropic.Anthropic(api_key=API_CRITIC_KEY, base_url=BASE_URL)
-        self.memory = MemoryManager(self.user_id)
+        self.memory = MemoryManager(self.user_id, api_key=API_KEY)
         # 注册表：隐藏参数（_client / user_id / _memory）由 partial 绑定，不进 schema、不暴露给 LLM
         self.tool_registry = {
             **TOOL_REGISTRY,

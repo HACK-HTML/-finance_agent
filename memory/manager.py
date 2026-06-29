@@ -24,8 +24,9 @@ from typing import Optional
 class MemoryManager:
     """Mem0 记忆的读写封装。每个 user_id 一个实例。"""
 
-    def __init__(self, user_id: str):
+    def __init__(self, user_id: str, api_key: str = ""):
         self.user_id = user_id
+        self.api_key = api_key
         self._memory = None
         self._lock = threading.Lock()
 
@@ -35,14 +36,25 @@ class MemoryManager:
             with self._lock:
                 if self._memory is None:
                     from mem0 import Memory
-                    # Qdrant collection 和 finance_docs 隔离
-                    # Mem0 内部用 SQLite 存元数据，Qdrant 存向量
                     config = {
+                        "llm": {
+                            "provider": "deepseek",
+                            "config": {
+                                "api_key": self.api_key,
+                                "model": "deepseek-chat",
+                            },
+                        },
+                        "embedder": {
+                            "provider": "fastembed",
+                            "config": {
+                                "model": "BAAI/bge-small-zh-v1.5",
+                            },
+                        },
                         "vector_store": {
                             "provider": "qdrant",
                             "config": {
                                 "collection_name": "user_memories",
-                                "path": "./storage/qdrant",
+                                "path": "./storage/mem0_qdrant",
                             },
                         },
                         "history_db_path": "./storage/mem0_history.db",
@@ -74,13 +86,13 @@ class MemoryManager:
         """
         try:
             self._ensure()
-            raw = self._memory.search(query, user_id=self.user_id, limit=top_k)
+            raw = self._memory.search(query, filters={"user_id": self.user_id}, top_k=top_k)
         except Exception as e:
             print(f"[Mem0 search error] user={self.user_id}: {e}")
             return []
 
         results = []
-        for item in raw:
+        for item in raw.get("results", []):
             score = item.get("score", 0.0)
             content = item.get("memory", "")
             if score >= threshold and content.strip():
@@ -114,7 +126,7 @@ class MemoryManager:
         """获取该用户所有记忆（调试 / 管理用）。"""
         try:
             self._ensure()
-            return self._memory.get_all(user_id=self.user_id)
+            return self._memory.get_all(filters={"user_id": self.user_id})
         except Exception as e:
             print(f"[Mem0 get_all error] user={self.user_id}: {e}")
             return []
