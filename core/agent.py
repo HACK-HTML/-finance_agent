@@ -8,7 +8,8 @@ import json
 import anthropic
 import asyncio
 from models.schemas import AgentState, ToolCall, ToolResult, ConversationTurn, MonthlyReport
-from tools.registry import TOOL_REGISTRY, TOOL_SCHEMAS, generate_budget_plan, retrieve_document
+from tools.registry import TOOL_REGISTRY, TOOL_SCHEMAS, generate_budget_plan, retrieve_document, memory_recall
+from memory import MemoryManager
 
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
@@ -23,36 +24,50 @@ SYSTEM_PROMPT = f"""你是一个专业的个人财务分析助手。你能帮用
 - 查询实时汇率或模拟股票数据
 - 制定预算方案并评估财务健康度
 - 阅读并检索用户上传的财务文档（理财产品说明书 / 账单 / 年报等），回答文档相关问题
+- 调用 memory_recall 检索用户之前对话中透露的个人信息（收入/目标/偏好），用这些信息给出个性化建议
 - 多轮追问，持续深入分析
-- 当用户请求月度报告时，输出符合以下 JSON Schema 的内容：{MonthlyReport.model_json_schema()}
-- 当用户请求制定预算方案时，
+
 
 工作原则：
-1. 先思考需要哪些信息，再决定调用哪个工具
+1. 先思考需要哪些信息，再决定调用哪个工具，严格参照Tool Schemas调用工具
 2. 工具返回结果后，判断是否需要继续调用或可以给出最终答案
 3. 数字计算必须使用 calculate 工具，不要心算
 4. 当问题的答案依赖用户上传的具体文档内容（如某产品的费率、合同条款、年报数据、
    账单明细）时，调用 retrieve_document 检索原文，并基于检索结果作答、标注来源；
    检索片段中没有的信息不要编造。纯计算 / 实时行情 / 通用常识则用对应工具或直接回答，
    不要滥用文档检索。
-5. 回答要具体，给出可操作的建议
+5. 当系统提示中包含「用户记忆摘要」且与当前问题相关时，优先基于记忆给出个性化建议；
+   摘要不够详细时可调用 memory_recall 获取完整记忆内容。
+6. 回答要具体，给出可操作的建议
 """
 
 
 # ── ReAct 核心循环 ────────────────────────────────────────────────────────────
 class FinanceAgent:
-    def __init__(self, session_id: str = "default"):
-        self.session_id = session_id          # ★ 用于把文档检索限定在本会话的文档范围内
-        self.client = anthropic.Anthropic(api_key=API_KEY,base_url=BASE_URL)
+    def __init__(self, session_id: str = "default", user_id: str | None = None):
+        self.session_id = session_id          # 会话维度（消息历史 / 文档上传）
+        self.user_id = user_id or session_id  # 用户维度（记忆 + 文档检索，跨会话共享）
+        self.client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL)
         self.state = AgentState()
-        self._critic=anthropic.Anthropic(api_key=API_CRITIC_KEY,base_url=BASE_URL)
-        # 注册表：预算工具预先绑定 _client，检索工具预先绑定 session_id，其余工具原样
+        self._critic = anthropic.Anthropic(api_key=API_CRITIC_KEY, base_url=BASE_URL)
+        self.memory = MemoryManager(self.user_id)
+        # 注册表：隐藏参数（_client / user_id / _memory）由 partial 绑定，不进 schema、不暴露给 LLM
         self.tool_registry = {
-            **TOOL_REGISTRY,  # 其他工具
+            **TOOL_REGISTRY,
             "generate_budget_plan": partial(generate_budget_plan, _client=self._critic),
-            # ★ session_id 是隐藏参数，不进 schema、不暴露给 LLM，由 partial 绑定
-            "retrieve_document": partial(retrieve_document, session_id=self.session_id),
+            "retrieve_document": partial(retrieve_document, user_id=self.user_id),
+            "memory_recall": partial(memory_recall, _memory=self.memory),
         }
+
+    # ── 动态 System Prompt ─────────────────────────────────────────────────────
+
+    def _make_system_prompt(self, user_input: str) -> str:
+        """每轮对话前根据用户输入检索记忆摘要，动态拼入 system prompt 尾部。"""
+        results = self.memory.search(user_input)
+        summary = self.memory.format_summary(results)
+        return SYSTEM_PROMPT + "\n\n## 用户记忆摘要\n" + summary
+
+    # ── 对话入口 ────────────────────────────────────────────────────────────────
 
     async def chat(self, user_input: str) -> str:
         """
@@ -75,24 +90,27 @@ class FinanceAgent:
             print(f"\n{'─'*50}")
             print(f"[ReAct 第 {iteration} 轮]")
 
-            # 2. 调用 Claude，附带工具定义
+            # 2. 每轮动态拼 system prompt（注入相关记忆摘要）
+            system = self._make_system_prompt(user_input)
+
+            # 3. 调用 Claude，附带工具定义
             response = self.client.messages.create(
                 model=MODEL,
-                max_tokens=4096*2,
-                system=SYSTEM_PROMPT,
+                max_tokens=4096 * 2,
+                system=system,
                 tools=TOOL_SCHEMAS,
                 messages=self.state.messages,
             )
 
             print(f"[stop_reason] {response.stop_reason}")
 
-            # 3. 把 Claude 的回复加入历史（必须在处理工具调用之前）
+            # 4. 把 Claude 的回复加入历史（必须在处理工具调用之前）
             self.state.messages.append({
                 "role": "assistant",
                 "content": response.content
             })
 
-            # 4. 判断停止原因
+            # 5. 判断停止原因
             # end_turn = Claude 认为不需要工具，直接给出最终答案
             if response.stop_reason == "end_turn":
                 final_text = self._extract_text(response.content)
@@ -100,13 +118,21 @@ class FinanceAgent:
                     ConversationTurn(user=user_input, assistant=final_text)
                 )
                 print(f"[最终回答] 完成（共 {iteration} 轮 ReAct）")
+
+                # ★ 异步存储记忆：fire-and-forget，不阻塞回答返回
+                asyncio.create_task(
+                    asyncio.to_thread(
+                        self.memory.add_async,
+                        f"用户：{user_input}\n助手：{final_text}"
+                    )
+                )
                 return final_text
 
             # tool_use = Claude 决定调用一个或多个工具
             if response.stop_reason == "tool_use":
                 tool_results = await self._execute_tools(response.content)
 
-                # 5. 把工具执行结果作为 user 消息反馈给 Claude
+                # 6. 把工具执行结果作为 user 消息反馈给 Claude
                 # 这就是 ReAct 中的 "Observe" 步骤
                 self.state.messages.append({
                     "role": "user",
@@ -115,55 +141,18 @@ class FinanceAgent:
                 continue  # 进入下一轮，让 Claude 基于工具结果继续推理
 
             # 兜底：其他停止原因直接取文本
-            return self._extract_text(response.content)
+            final_text = self._extract_text(response.content)
+            asyncio.create_task(
+                asyncio.to_thread(
+                    self.memory.add_async,
+                    f"用户：{user_input}\n助手：{final_text}"
+                )
+            )
+            return final_text
 
         return "已达到最大推理轮数，请简化问题后重试。"
 
-
-    """def _execute_tools(self, content_blocks: list) -> list[dict]:
-        """"""
-        遍历 Claude 响应中的所有 tool_use 块，逐一执行。
-        返回格式符合 Anthropic API 规范的 tool_result 列表。
-        """"""
-        tool_results = []
-
-        for block in content_blocks:
-            if block.type != "tool_use":
-                continue
-
-            tool_call = ToolCall(
-                tool_use_id=block.id,
-                tool_name=block.name,
-                tool_input=block.input,
-            )
-
-            print(f"[工具调用] {block.name}({json.dumps(block.input, ensure_ascii=False)})")
-
-            # 查找工具函数并执行
-            tool_fn = TOOL_REGISTRY.get(block.name)
-            if tool_fn is None:
-                result_content = f"错误：工具 '{block.name}' 未注册"
-            else:
-                try:
-                    result_content = tool_fn(**block.input)
-                except Exception as e:
-                    result_content = f"工具执行出错：{str(e)}"
-
-            print(f"[工具结果] {str(result_content)[:200]}")
-
-            # 记录工具调用历史
-            self.state.tool_history.append(
-                ToolResult(tool_call=tool_call, result=str(result_content))
-            )
-
-            # 构建符合 API 规范的 tool_result 块
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": str(result_content),
-            })
-
-        return tool_results"""
+    # ── 工具执行 ────────────────────────────────────────────────────────────────
 
     async def _execute_single_tool(self, block) -> tuple[ToolCall, str]:
         """执行单个工具调用，返回 (调用记录, 结果字符串)。永不抛异常。"""
@@ -181,11 +170,8 @@ class FinanceAgent:
         else:
             try:
                 if asyncio.iscoroutinefunction(tool_fn):
-                    # 原生 async 工具：直接 await
                     result_content = await tool_fn(**block.input)
-
                 else:
-                    # 同步工具（requests、pandas 计算等）：丢到线程池，避免阻塞事件循环
                     result_content = await asyncio.to_thread(tool_fn, **block.input)
             except Exception as e:
                 result_content = f"工具执行出错：{str(e)}"
@@ -202,14 +188,12 @@ class FinanceAgent:
         if not tool_use_blocks:
             return []
 
-        # gather 保证返回顺序与任务提交顺序一致
         results = await asyncio.gather(
             *(self._execute_single_tool(block) for block in tool_use_blocks)
         )
 
         tool_results = []
         for block, (tool_call, result_content) in zip(tool_use_blocks, results):
-            # 统一在 gather 之后写入历史，避免并发 append 导致顺序混乱
             self.state.tool_history.append(
                 ToolResult(tool_call=tool_call, result=result_content)
             )

@@ -36,6 +36,7 @@ sessions: dict[str, FinanceAgent] = {}
 class ChatRequest(BaseModel):
     message: str
     session_id: str | None = None  # 不传则自动创建新会话
+    user_id: str | None = None     # ★ 跨会话用户身份（记忆 + 文档检索隔离维度）
 
 
 class ChatResponse(BaseModel):
@@ -74,8 +75,8 @@ async def chat(req: ChatRequest):
     # 获取或创建会话
     sid = req.session_id or str(uuid.uuid4())
     if sid not in sessions:
-        sessions[sid] = FinanceAgent(session_id=sid)   # ★ 把会话 id 传进去
-        print(f"[新会话] {sid}")
+        sessions[sid] = FinanceAgent(session_id=sid, user_id=req.user_id or sid)
+        print(f"[新会话] {sid}  (user={req.user_id or sid})")
 
     agent = sessions[sid]
 
@@ -90,15 +91,17 @@ async def chat(req: ChatRequest):
     )
 
 
-@app.post("/upload", summary="上传 PDF 文档进入指定会话的知识库")
-async def upload(file: UploadFile = File(...), session_id: str | None = Form(None)):
+@app.post("/upload", summary="上传 PDF 文档进入指定用户的知识库")
+async def upload(file: UploadFile = File(...), session_id: str | None = Form(None),
+                 user_id: str | None = Form(None)):
     """
-    用户上传 PDF → 切块 + 向量化 → 写入该会话的 Qdrant 知识库。
-    之后同一 session_id 的对话里，Agent 即可用 retrieve_document 检索这份文档。
+    用户上传 PDF → 切块 + 向量化 → 写入该用户的 Qdrant 知识库。
+    同一 user_id 的文档在所有 session 中均可检索。
     """
     sid = session_id or str(uuid.uuid4())
+    uid = user_id or sid
     if sid not in sessions:
-        sessions[sid] = FinanceAgent(session_id=sid)
+        sessions[sid] = FinanceAgent(session_id=sid, user_id=uid)
 
     # 落到临时文件再交给 ingest（pypdf 需要文件路径）
     suffix = os.path.splitext(file.filename or "doc.pdf")[1] or ".pdf"
@@ -108,12 +111,20 @@ async def upload(file: UploadFile = File(...), session_id: str | None = Form(Non
     try:
         # ingest 是同步且较重（模型推理），丢到线程池避免阻塞事件循环
         stats = await asyncio.to_thread(
-            get_store().ingest_pdf, tmp_path, sid, file.filename
+            get_store().ingest_pdf, tmp_path, uid, sid, file.filename
         )
     finally:
         os.unlink(tmp_path)
 
-    return {"session_id": sid, "message": "✅ 文档已入库，可以开始提问", **stats}
+    # replaced_old_chunks > 0 说明同名文档已存在，本次为「替换」而非「新增」
+    replaced = stats.get("replaced_old_chunks", 0)
+    if replaced:
+        message = (f"♻️ 检测到重复上传，已用新版本替换旧文档"
+                   f"（清理旧片段 {replaced} 块，写入新片段 {stats['chunks']} 块）")
+    else:
+        message = f"✅ 文档已入库（{stats['chunks']} 块），可以开始提问"
+
+    return {"session_id": sid, "user_id": uid, "message": message, **stats}
 
 
 @app.get("/session/{session_id}", response_model=SessionInfo, summary="查看会话详情")

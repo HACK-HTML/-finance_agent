@@ -15,21 +15,23 @@ from __future__ import annotations
 from tools.rag_pipeline import get_store, RetrievedChunk
 
 
-def retrieve_document(query: str, *, session_id: str = "default") -> str:
+def retrieve_document(query: str, *, user_id: str = "default") -> str:
     """
     在用户上传的财务文档（理财产品说明书 / 账单 / 年报等）里做语义检索，
     返回最相关的若干原文片段（带来源与页码，便于回答时引用）。
 
-    session_id 是「隐藏参数」：由 Agent 在注册时用 functools.partial 绑定，
+    user_id 是「隐藏参数」：由 Agent 在注册时用 functools.partial 绑定，
     不暴露给 LLM，因此模型只会传 `query`（与 generate_budget_plan 绑定 _client 同理）。
+    ★ Day 3-4 修复：从 session_id 改为 user_id，和记忆用同一隔离维度。
+    同一用户的不同 session 共享文档检索结果。
     """
     store = get_store()
 
-    if not store.has_documents(session_id):
-        return ("【知识库为空】当前会话还没有上传任何文档，无法检索。"
+    if not store.has_documents(user_id):
+        return ("【知识库为空】当前用户还没有上传任何文档，无法检索。"
                 "请提示用户先上传财务文档（PDF），或改用计算/分析类工具回答通用问题。")
 
-    chunks: list[RetrievedChunk] = store.retrieve(query, session_id=session_id)
+    chunks: list[RetrievedChunk] = store.retrieve(query, user_id=user_id)
     if not chunks:
         return (f"【未检索到相关内容】文档里没有与「{query}」直接相关的片段。"
                 "可以换个说法再检索，或如实告诉用户文档中未涉及该信息——不要编造。")

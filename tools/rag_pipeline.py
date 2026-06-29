@@ -235,8 +235,8 @@ class DocumentStore:
                 ),
             )
 
-    def ingest_pdf(self, pdf_path: str, session_id: str = "default",
-                   doc_name: Optional[str] = None) -> dict:
+    def ingest_pdf(self, pdf_path: str, user_id: str = "default",
+                   session_id: str = "", doc_name: Optional[str] = None) -> dict:
         """抽取 → 切块 → 编码 → 写入 Qdrant。返回入库统计。"""
         doc_name = doc_name or os.path.basename(pdf_path)
         pages = extract_pdf_pages(pdf_path)
@@ -249,18 +249,23 @@ class DocumentStore:
             for ch in chunk_text(page_text, self.cfg.chunk_size, self.cfg.chunk_overlap):
                 records.append((ch, page_no))
 
-        return self._upsert(records, session_id, doc_name)
+        return self._upsert(records, user_id, session_id, doc_name)
 
-    def ingest_text(self, text: str, session_id: str = "default",
-                    doc_name: str = "inline_text") -> dict:
+    def ingest_text(self, text: str, user_id: str = "default",
+                    session_id: str = "", doc_name: str = "inline_text") -> dict:
         """直接喂纯文本（测试 / 非 PDF 来源用）。"""
         chunks = chunk_text(_clean_text(text), self.cfg.chunk_size, self.cfg.chunk_overlap)
         records = [(c, 0) for c in chunks]
-        return self._upsert(records, session_id, doc_name)
+        return self._upsert(records, user_id, session_id, doc_name)
 
-    def _upsert(self, records: list[tuple[str, int]], session_id: str, doc_name: str) -> dict:
+    def _upsert(self, records: list[tuple[str, int]], user_id: str,
+                session_id: str, doc_name: str) -> dict:
         with self._lock:
             self._ensure_collection()
+
+            # ★ 幂等：同一用户内重传同名文档 = 替换
+            replaced = self._delete_by_source(user_id, doc_name)
+
             texts = [r[0] for r in records]
             vectors = self.embedder.embed_passages(texts)
             points = [
@@ -271,16 +276,31 @@ class DocumentStore:
                         "text": text,
                         "source": doc_name,
                         "page": page,
-                        "session_id": session_id,   # ★ 多会话隔离的关键字段
+                        "user_id": user_id,           # ★ Day 3-4：检索隔离改按用户
+                        "session_id": session_id,      # 保留供审计
                     },
                 )
                 for (text, page), vec in zip(records, vectors)
             ]
             self.client.upsert(self.cfg.collection_name, points=points)
-        return {"doc_name": doc_name, "chunks": len(points)}
+        return {"doc_name": doc_name, "chunks": len(points), "replaced_old_chunks": replaced}
+
+    def _delete_by_source(self, user_id: str, doc_name: str) -> int:
+        """删除某用户下某文档已有的全部 chunk，返回删除前的数量（无则 0）。"""
+        if not self.client.collection_exists(self.cfg.collection_name):
+            return 0
+        flt = models.Filter(must=[
+            models.FieldCondition(key="user_id", match=models.MatchValue(value=user_id)),
+            models.FieldCondition(key="source", match=models.MatchValue(value=doc_name)),
+        ])
+        existed = self.client.count(self.cfg.collection_name, count_filter=flt).count
+        if existed:
+            self.client.delete(self.cfg.collection_name,
+                               points_selector=models.FilterSelector(filter=flt))
+        return existed
 
     # —— 检索（两阶段）——
-    def retrieve(self, query: str, session_id: str = "default",
+    def retrieve(self, query: str, user_id: str = "default",
                  top_k: Optional[int] = None, top_n: Optional[int] = None
                  ) -> list[RetrievedChunk]:
         top_k = top_k or self.cfg.top_k
@@ -289,9 +309,9 @@ class DocumentStore:
         if not self.client.collection_exists(self.cfg.collection_name):
             return []
 
-        # 阶段一：向量粗召回（只在当前 session 的文档里找）
+        # 阶段一：向量粗召回（只在当前用户的文档里找）
         flt = models.Filter(must=[models.FieldCondition(
-            key="session_id", match=models.MatchValue(value=session_id))])
+            key="user_id", match=models.MatchValue(value=user_id))])
         hits = self.client.query_points(
             collection_name=self.cfg.collection_name,
             query=self.embedder.embed_query(query),
@@ -313,11 +333,11 @@ class DocumentStore:
         return out
 
     # —— 杂项 ——
-    def has_documents(self, session_id: str = "default") -> bool:
+    def has_documents(self, user_id: str = "default") -> bool:
         if not self.client.collection_exists(self.cfg.collection_name):
             return False
         flt = models.Filter(must=[models.FieldCondition(
-            key="session_id", match=models.MatchValue(value=session_id))])
+            key="user_id", match=models.MatchValue(value=user_id))])
         got, _ = self.client.scroll(self.cfg.collection_name, scroll_filter=flt, limit=1)
         return len(got) > 0
 

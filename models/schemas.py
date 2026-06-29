@@ -74,6 +74,15 @@ class BudgetPlan(BaseModel):
     )
     emergency_fund_months: float = Field(description="应急资金可支撑月数")
     investment_suggestion: str
+
+
+class MemorySummary(BaseModel):
+    """从记忆库中召回的一条用户信息——用于注入 system prompt 或评估统计"""
+    content: str = Field(description="记忆内容摘要")
+    score: float = Field(description="相关性分数 0-1", ge=0, le=1)
+    recalled_at: datetime = Field(default_factory=datetime.now)
+
+
 from pydantic import BaseModel, Field, model_validator
 from typing import Optional
 
