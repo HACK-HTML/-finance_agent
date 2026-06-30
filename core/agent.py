@@ -2,6 +2,7 @@
 核心 Agent — 手写 ReAct 循环，无任何框架依赖
 ReAct = Reasoning + Acting，每步：Think → Act（调用工具）→ Observe（看结果）→ 重复
 """
+import os
 from pprint import pprint
 from functools import partial
 import json
@@ -13,10 +14,17 @@ from memory import MemoryManager
 
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
-API_KEY='sk-39cec1aa846844aaa5ece145cb738bd2'
-API_CRITIC_KEY='sk-33d367956a054b1c8f5870667ff821d6'
-MEM0_KEY='sk-f6897c12400d4e5eb18149825e80ec83'
-MEM0_API_KEY='m0-u2TVRNuOY1v8dbMi8ry7ZqO5RDpprLENYPNW8qD9'
+def _require_env(name: str) -> str:
+    """读取必须的环境变量，缺失时抛出清晰的错误提示。"""
+    val = os.environ.get(name)
+    if not val:
+        raise RuntimeError(
+            f"缺少必须的环境变量 {name}。请在 .env 文件或系统环境中设置该变量。"
+        )
+    return val
+
+API_KEY = _require_env("DEEPSEEK_API_KEY")
+API_CRITIC_KEY = _require_env("DEEPSEEK_CRITIC_API_KEY")
 
 MODEL='deepseek-v4-pro'
 BASE_URL = 'https://api.deepseek.com/anthropic'
@@ -52,7 +60,7 @@ class FinanceAgent:
         self.client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL)
         self.state = AgentState()
         self._critic = anthropic.Anthropic(api_key=API_CRITIC_KEY, base_url=BASE_URL)
-        self.memory = MemoryManager(self.user_id,api_key=MEM0_KEY)
+        self.memory = MemoryManager(self.user_id, api_key=API_KEY)
         # 注册表：隐藏参数（_client / user_id / _memory）由 partial 绑定，不进 schema、不暴露给 LLM
         self.tool_registry = {
             **TOOL_REGISTRY,
