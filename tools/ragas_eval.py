@@ -8,6 +8,10 @@ context_precision / context_recall）对比两种检索配置：
   - Baseline：固定 top_k=20 / top_n=5，无 Router / Critic
   - Agentic：QueryRouter 动态选策略 + RetrievalCritic 质量门控 + 改写重检
 
+生成器使用项目的 FinanceAgent（core/agent.py），通过
+agent.generate_from_contexts() 直接用 Agent 的 LLM + system prompt
+生成回答，确保评估结果反映真实 Agent 的生成质量。
+
 运行前先跑前置验证：python tools/ragas_eval_verify.py
 
 用法：
@@ -41,6 +45,7 @@ from tools.retrieve_tool import retrieve_document_structured
 EVAL_USER_ID = "ragas_eval_user"
 OUTPUT_DIR = os.path.join(_PROJ_ROOT, "course")
 
+
 # ── 检索函数（两种配置）────────────────────────────────────────────────────
 
 def retrieve_baseline(query: str) -> list[str]:
@@ -56,10 +61,10 @@ def retrieve_agentic(query: str) -> list[str]:
     return [c.text for c in chunks]
 
 
-# ── LLM 组件 ──────────────────────────────────────────────────────────────
+# ── Judge LLM + Embeddings（RAGAS 评分用）─────────────────────────────────
 
-def _build_llm_components():
-    """创建 generator LLM + judge LLM + evaluator embeddings。"""
+def _build_judge_components():
+    """创建 RAGAS judge LLM + evaluator embeddings。生成器由 FinanceAgent 负责。"""
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError(
@@ -67,16 +72,8 @@ def _build_llm_components():
             "  export DEEPSEEK_API_KEY=your-key"
         )
 
-    # Generator：生成回答（temperature 可以非零，但 0 更可复现）
-    from langchain_openai import ChatOpenAI
-    generator_llm = ChatOpenAI(
-        model="deepseek-v4-pro",
-        openai_api_key=api_key,
-        openai_api_base="https://api.deepseek.com/",
-        temperature=0,
-    )
-
     # Judge：RAGAS 评分（必须 temperature=0）
+    from langchain_openai import ChatOpenAI
     from ragas.llms import LangchainLLMWrapper
     judge_llm = LangchainLLMWrapper(ChatOpenAI(
         model="deepseek-v4-pro",
@@ -92,39 +89,7 @@ def _build_llm_components():
         HuggingFaceEmbeddings(model_name="BAAI/bge-base-zh-v1.5")
     )
 
-    return generator_llm, judge_llm, evaluator_emb
-
-
-# ── 生成器 ────────────────────────────────────────────────────────────────
-
-_GENERATOR_PROMPT = (
-    "你是一个财务文档问答助手。请严格基于下面提供的文档片段回答用户的问题。\n"
-    "要求：\n"
-    "1. 如果片段中包含答案，直接回答并引用相关片段编号\n"
-    "2. 如果片段中部分包含答案，回答已知部分并说明哪些信息缺失\n"
-    "3. 如果片段中完全没有答案，诚实地说「根据提供的文档片段，无法回答此问题」，不要编造\n\n"
-    "文档片段：\n{contexts}\n\n"
-    "用户问题：{question}\n\n"
-    "请回答："
-)
-
-
-def generate_answer(question: str, contexts: list[str], llm) -> str:
-    """基于检索到的 contexts 生成回答。"""
-    if not contexts:
-        return "根据提供的文档片段，无法回答此问题。"
-
-    ctx_block = "\n\n---\n\n".join(
-        f"[片段{i+1}] {c}" for i, c in enumerate(contexts)
-    )
-    prompt = _GENERATOR_PROMPT.format(contexts=ctx_block, question=question)
-
-    try:
-        resp = llm.invoke(prompt)
-        return resp.content
-    except Exception as e:
-        print(f"  [WARN] 生成失败：{e}")
-        return f"（生成错误：{e}）"
+    return judge_llm, evaluator_emb
 
 
 # ── 主评估流程 ─────────────────────────────────────────────────────────────
@@ -132,14 +97,18 @@ def generate_answer(question: str, contexts: list[str], llm) -> str:
 def run_evaluation(
     qa_pairs: list[dict],
     retrieve_fn,
-    generator_llm,
+    agent,            # FinanceAgent —— 用项目的真实 Agent 生成回答
     judge_llm,
     evaluator_emb,
     label: str,
 ) -> tuple[list[dict], object]:
     """
     对全部 QA 对跑一轮完整评估：
-      retrieve → generate → build dataset → RAGAS evaluate
+      retrieve → Agent.generate_from_contexts() → build dataset → RAGAS evaluate
+
+    agent.generate_from_contexts() 使用 Agent 自身的 LLM client + system prompt，
+    但不经过 ReAct 工具调用循环——检索已由 retrieve_fn 完成，Agent 只负责基于
+    检索结果生成回答。这确保评估反映真实 Agent 的生成质量。
 
     返回：(records, ragas_result)
     """
@@ -159,7 +128,8 @@ def run_evaluation(
     for i, qa in enumerate(qa_pairs, 1):
         t0 = time.time()
         contexts = retrieve_fn(qa["question"])
-        answer = generate_answer(qa["question"], contexts, generator_llm)
+        # ★ 使用 FinanceAgent.generate_from_contexts() 替代裸 LLM
+        answer = agent.generate_from_contexts(qa["question"], contexts)
         elapsed = time.time() - t0
 
         records.append({
@@ -225,6 +195,8 @@ def save_results(records: list[dict], result, label: str, config: dict) -> str:
 
 def save_comparison(result_baseline, result_agentic, records: list[dict]):
     """生成 side-by-side delta 表 + 分层分析。"""
+    import pandas as pd
+
     comp_path = os.path.join(OUTPUT_DIR, "ragas_finance_comparison.txt")
 
     def _get_score(result, metric_name: str) -> float:
@@ -234,18 +206,13 @@ def save_comparison(result_baseline, result_agentic, records: list[dict]):
             return float("nan")
 
     metrics = ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
-    metric_labels = {
-        "faithfulness": "忠实度（测幻觉）",
-        "answer_relevancy": "答案相关性",
-        "context_precision": "检索精度（信噪比）",
-        "context_recall": "检索召回（覆盖率）",
-    }
 
     with open(comp_path, "w", encoding="utf-8") as f:
         f.write("=" * 70 + "\n")
         f.write("  RAGAS 评估对比：基础 RAG vs Agentic RAG（智能检索）\n")
         f.write("=" * 70 + "\n")
         f.write(f"样本数: {len(records)}\n")
+        f.write("generator: FinanceAgent (deepseek-v4-pro + 项目 system prompt)\n")
         f.write("judge: deepseek-v4-pro (temperature=0)\n")
         f.write("embedding: BAAI/bge-base-zh-v1.5\n")
         f.write("chunk_size=500, chunk_overlap=80\n")
@@ -257,13 +224,13 @@ def save_comparison(result_baseline, result_agentic, records: list[dict]):
         for m in metrics:
             b = _get_score(result_baseline, m)
             a = _get_score(result_agentic, m)
-            delta = a - b if not (pd.isna(b) or pd.isna(a)) else float("nan")  # noqa: F821
-            b_str = f"{b:.4f}" if not pd.isna(b) else "N/A"  # noqa: F821
+            delta = a - b if not (pd.isna(b) or pd.isna(a)) else float("nan")
+            b_str = f"{b:.4f}" if not pd.isna(b) else "N/A"
             a_str = f"{a:.4f}" if not pd.isna(a) else "N/A"
             d_str = f"{delta:+.4f}" if not pd.isna(delta) else "N/A"
             f.write(f"{m:<25s} {b_str:>10s} {a_str:>10s} {d_str:>10s}\n")
 
-        # 分层分析（按 category）
+        # 分层分析
         f.write("\n" + "-" * 55 + "\n")
         f.write("按问题类型分层\n")
         f.write("-" * 55 + "\n")
@@ -275,7 +242,7 @@ def save_comparison(result_baseline, result_agentic, records: list[dict]):
             if cat == "honesty_probe":
                 f.write("  （诚实性探针主要关注 faithfulness——系统是否诚实说无法回答）\n")
             else:
-                f.write(f"  context_precision / context_recall 有待后续分层评估时细化\n")
+                f.write("  context_precision / context_recall 有待后续分层评估时细化\n")
 
         # 面试解读提示
         f.write("\n" + "-" * 55 + "\n")
@@ -302,23 +269,25 @@ def main():
     store = get_store()
     if not store.has_documents(EVAL_USER_ID):
         print("首次运行：将财务 PDF 入库到 Qdrant ...")
-        _proj = _PROJ_ROOT
         for pdf_name in ["ABC_Tech_2024_Annual_Report.pdf",
                          "Huaxia_Stable_Growth_365_Prospectus.pdf"]:
-            pdf_path = os.path.join(_proj, pdf_name)
+            pdf_path = os.path.join(_PROJ_ROOT, pdf_name)
             if os.path.exists(pdf_path):
                 r = store.ingest_pdf(pdf_path, user_id=EVAL_USER_ID)
                 print(f"  {pdf_name}: {r['chunks']} chunks")
 
-    # 构建 LLM 组件
-    print("初始化 LLM 组件 ...")
-    generator_llm, judge_llm, evaluator_emb = _build_llm_components()
-    print("  generator: deepseek-v4-pro")
-    print("  judge:     deepseek-v4-pro (temperature=0)")
-    print("  embedding: BAAI/bge-base-zh-v1.5")
+    # 创建 FinanceAgent（项目的真实 Agent，用于生成回答）
+    from core.agent import FinanceAgent
+    agent = FinanceAgent(session_id="ragas_eval", user_id=EVAL_USER_ID)
+    print(f"生成器: FinanceAgent (model=deepseek-v4-pro, 使用项目 system prompt)")
+
+    # 创建 RAGAS Judge + Embeddings
+    judge_llm, evaluator_emb = _build_judge_components()
+    print(f"judge: deepseek-v4-pro (temperature=0)")
+    print(f"embedding: BAAI/bge-base-zh-v1.5")
 
     config = {
-        "generator": "deepseek-v4-pro",
+        "generator": "FinanceAgent (deepseek-v4-pro + 项目 system prompt)",
         "judge": "deepseek-v4-pro (temperature=0)",
         "embedding": "BAAI/bge-base-zh-v1.5",
         "chunk_size": 500,
@@ -333,7 +302,7 @@ def main():
     if run_both or args.baseline:
         records_bl, result_baseline = run_evaluation(
             FINANCIAL_QA_PAIRS, retrieve_baseline,
-            generator_llm, judge_llm, evaluator_emb,
+            agent, judge_llm, evaluator_emb,
             label="baseline",
         )
         save_results(records_bl, result_baseline, "baseline", {
@@ -344,7 +313,7 @@ def main():
     if run_both or args.agentic:
         records_ag, result_agentic = run_evaluation(
             FINANCIAL_QA_PAIRS, retrieve_agentic,
-            generator_llm, judge_llm, evaluator_emb,
+            agent, judge_llm, evaluator_emb,
             label="agentic",
         )
         save_results(records_ag, result_agentic, "agentic", {
@@ -361,6 +330,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # pandas 在 save_comparison 中用到，顶部 lazy import 避免脚本启动慢
-    import pandas as pd
     main()

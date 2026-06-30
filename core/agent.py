@@ -220,6 +220,44 @@ class FinanceAgent:
         texts = [b.text for b in content_blocks if hasattr(b, "text")]
         return "\n".join(texts) if texts else "（无文本输出）"
 
+    # ── 基于上下文的问答（供 RAGAS 评估使用）──────────────────────────────────
+
+    def generate_from_contexts(self, question: str, contexts: list[str]) -> str:
+        """
+        基于预检索的文档片段生成回答，不经过 ReAct 工具调用循环。
+        供 RAGAS 评估等需要可控检索的场景使用——评估脚本负责检索，
+        Agent 负责用自身的 LLM 和 system prompt 生成回答。
+
+        返回：LLM 生成的回答文本。
+        """
+        if not contexts:
+            return "根据提供的文档片段，无法回答此问题。"
+
+        ctx_block = "\n\n---\n\n".join(
+            f"[片段{i+1}] {c}" for i, c in enumerate(contexts)
+        )
+        prompt = (
+            f"请严格基于下面提供的文档片段回答用户的问题。\n"
+            f"要求：\n"
+            f"1. 如果片段中包含答案，直接回答并引用相关片段编号\n"
+            f"2. 如果片段中部分包含答案，回答已知部分并说明哪些信息缺失\n"
+            f"3. 如果片段中完全没有答案，诚实地说「根据提供的文档片段，无法回答此问题」，不要编造\n\n"
+            f"文档片段：\n{ctx_block}\n\n"
+            f"用户问题：{question}\n\n"
+            f"请回答："
+        )
+
+        try:
+            response = self.client.messages.create(
+                model=MODEL,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            return self._extract_text(response.content)
+        except Exception as e:
+            return f"（生成错误：{e}）"
+
     def reset(self):
         """重置对话，开始新会话"""
         self.state = AgentState()
