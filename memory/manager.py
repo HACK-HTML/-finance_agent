@@ -55,6 +55,7 @@ class MemoryManager:
                             "config": {
                                 "collection_name": "user_memories",
                                 "path": "./storage/mem0_qdrant",
+                                "embedding_model_dims": 512,  # ← 加这行，覆盖 Mem0 默认的 1536
                             },
                         },
                         "history_db_path": "./storage/mem0_history.db",

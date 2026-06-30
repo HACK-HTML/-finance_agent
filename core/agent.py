@@ -13,8 +13,10 @@ from memory import MemoryManager
 
 
 # ── 常量 ──────────────────────────────────────────────────────────────────────
-API_KEY='sk-9f690eab2b2340cdaf451dde1746830d'
+API_KEY='sk-39cec1aa846844aaa5ece145cb738bd2'
 API_CRITIC_KEY='sk-33d367956a054b1c8f5870667ff821d6'
+MEM0_KEY='sk-f6897c12400d4e5eb18149825e80ec83'
+MEM0_API_KEY='m0-u2TVRNuOY1v8dbMi8ry7ZqO5RDpprLENYPNW8qD9'
 
 MODEL='deepseek-v4-pro'
 BASE_URL = 'https://api.deepseek.com/anthropic'
@@ -50,7 +52,7 @@ class FinanceAgent:
         self.client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL)
         self.state = AgentState()
         self._critic = anthropic.Anthropic(api_key=API_CRITIC_KEY, base_url=BASE_URL)
-        self.memory = MemoryManager(self.user_id, api_key=API_KEY)
+        self.memory = MemoryManager(self.user_id,api_key=MEM0_KEY)
         # 注册表：隐藏参数（_client / user_id / _memory）由 partial 绑定，不进 schema、不暴露给 LLM
         self.tool_registry = {
             **TOOL_REGISTRY,
