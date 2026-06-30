@@ -100,6 +100,72 @@ class RetrievalCritic:
 
 # ── 工具函数 ────────────────────────────────────────────────────────────────
 
+def _do_retrieve(query: str, user_id: str) -> tuple[list[RetrievedChunk], str, str]:
+    """
+    共享检索逻辑：Router 分类 → 检索 → Critic 评估 → 可能改写重检。
+    返回 (chunks, query_type, reason_label)。供 retrieve_document 和
+    retrieve_document_structured 共用，避免代码重复。
+    """
+    store = get_store()
+    query_type = QueryRouter.classify(query)
+    strategy = QueryRouter.get_strategy(query_type)
+
+    chunks: list[RetrievedChunk] = store.retrieve(
+        query, user_id=user_id,
+        top_k=strategy["top_k"], top_n=strategy["top_n"],
+    )
+
+    ok, reason = RetrievalCritic.evaluate(chunks)
+    if not ok:
+        revised = RetrievalCritic.reformulate(query, reason)
+        if revised and revised != query:
+            chunks = store.retrieve(
+                revised, user_id=user_id,
+                top_k=max(strategy["top_k"], 30),
+                top_n=strategy["top_n"],
+            )
+
+    return chunks, query_type, reason
+
+
+def _format_chunks(query: str, chunks: list[RetrievedChunk], query_type: str) -> str:
+    """把检索结果格式化为 Agent 可读的文本。"""
+    lines = [f"📚 文档检索结果（query=「{query}」｜策略={query_type}｜按相关性排序）：", ""]
+    for i, c in enumerate(chunks, 1):
+        loc = f"{c.source}" + (f" · 第{c.page}页" if c.page else "")
+        lines.append(f"[片段{i}] 来源：{loc}｜相关性 {c.score:.2f}")
+        lines.append(c.text.strip())
+        lines.append("")
+    lines.append("——以上为原文片段。回答时请基于这些内容作答，并标注来源；"
+                 "片段中没有的信息不要臆造。")
+    return "\n".join(lines)
+
+
+def retrieve_document_structured(query: str, *, user_id: str = "default"
+                                 ) -> tuple[list[RetrievedChunk], str]:
+    """
+    和 retrieve_document() 相同的检索逻辑，但额外返回结构化的 RetrievedChunk 列表。
+    供 RAGAS 评估等需要原始 chunk 数据的场景使用。
+
+    返回：(chunks, formatted_text)
+      - chunks: 检索到的原文片段列表（含相关性分数、来源、页码）
+      - formatted_text: 和 retrieve_document() 完全相同的格式化文本
+    """
+    store = get_store()
+
+    if not store.has_documents(user_id):
+        return [], "【知识库为空】当前用户还没有上传任何文档，无法检索。" \
+                    "请提示用户先上传财务文档（PDF），或改用计算/分析类工具回答通用问题。"
+
+    chunks, query_type, _reason = _do_retrieve(query, user_id)
+
+    if not chunks:
+        return [], f"【未检索到相关内容】文档里没有与「{query}」直接相关的片段。" \
+                    "可以换个说法再检索，或如实告诉用户文档中未涉及该信息——不要编造。"
+
+    return chunks, _format_chunks(query, chunks, query_type)
+
+
 def retrieve_document(query: str, *, user_id: str = "default") -> str:
     """
     在用户上传的财务文档（理财产品说明书 / 账单 / 年报等）里做语义检索，
@@ -111,46 +177,8 @@ def retrieve_document(query: str, *, user_id: str = "default") -> str:
     不暴露给 LLM，因此模型只会传 `query`（与 generate_budget_plan 绑定 _client 同理）。
     ★ Day 3-4 修复：从 session_id 改为 user_id，和记忆用同一隔离维度。
     """
-    store = get_store()
-
-    if not store.has_documents(user_id):
-        return ("【知识库为空】当前用户还没有上传任何文档，无法检索。"
-                "请提示用户先上传财务文档（PDF），或改用计算/分析类工具回答通用问题。")
-
-    # ── Router：分类问题类型，选择检索策略 ──
-    query_type = QueryRouter.classify(query)
-    strategy = QueryRouter.get_strategy(query_type)
-
-    # ── 第一轮检索 ──
-    chunks: list[RetrievedChunk] = store.retrieve(
-        query, user_id=user_id,
-        top_k=strategy["top_k"], top_n=strategy["top_n"],
-    )
-
-    # ── Critic：评估质量，不足则改写查询重检索 ──
-    ok, reason = RetrievalCritic.evaluate(chunks)
-    if not ok:
-        revised = RetrievalCritic.reformulate(query, reason)
-        if revised and revised != query:
-            chunks = store.retrieve(
-                revised, user_id=user_id,
-                top_k=max(strategy["top_k"], 30),
-                top_n=strategy["top_n"],
-            )
-
-    if not chunks:
-        return (f"【未检索到相关内容】文档里没有与「{query}」直接相关的片段。"
-                "可以换个说法再检索，或如实告诉用户文档中未涉及该信息——不要编造。")
-
-    lines = [f"📚 文档检索结果（query=「{query}」｜策略={query_type}｜按相关性排序）：", ""]
-    for i, c in enumerate(chunks, 1):
-        loc = f"{c.source}" + (f" · 第{c.page}页" if c.page else "")
-        lines.append(f"[片段{i}] 来源：{loc}｜相关性 {c.score:.2f}")
-        lines.append(c.text.strip())
-        lines.append("")
-    lines.append("——以上为原文片段。回答时请基于这些内容作答，并标注来源；"
-                 "片段中没有的信息不要臆造。")
-    return "\n".join(lines)
+    _, formatted = retrieve_document_structured(query, user_id=user_id)
+    return formatted
 
 
 # ── 工具 Schema：给 Claude 看的「说明书」──────────────────────────────────────────
