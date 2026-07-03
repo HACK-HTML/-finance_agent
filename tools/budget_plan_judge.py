@@ -2,6 +2,7 @@
 10 个测试用例跑 Eval，对比 Reflection 前后输出质量
 用 LLM-as-Judge 给 Rubric 评分（储蓄率合理/建议可操作/数字正确），记录有 Reflection vs 无 Reflection 的评分差
 """
+import os
 import json
 import re
 import anthropic
