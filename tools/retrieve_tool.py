@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 
 from tools.rag_pipeline import get_store, RetrievedChunk
+from tools.tracing import traced, TraceContext, scrub_content
 
 
 # ── Router：根据问题类型选择检索策略 ──────────────────────────────────────────
@@ -43,6 +44,7 @@ class QueryRouter:
     )
 
     @classmethod
+    @traced(name="router.classify", capture_input=False)
     def classify(cls, query: str) -> str:
         """根据查询内容分类为 'exact' 或 'summary'。"""
         if cls._SUMMARY_RE.search(query):
@@ -66,6 +68,7 @@ class RetrievalCritic:
     MIN_MAX_SCORE: float = 0.5    # 最高分低于此 → 最好片段也差
 
     @staticmethod
+    @traced(name="critic.evaluate", capture_input=False)
     def evaluate(chunks: list[RetrievedChunk]) -> tuple[bool, str]:
         """返回 (是否合格, 原因标签)。"""
         if not chunks:
@@ -110,20 +113,50 @@ def _do_retrieve(query: str, user_id: str) -> tuple[list[RetrievedChunk], str, s
     query_type = QueryRouter.classify(query)
     strategy = QueryRouter.get_strategy(query_type)
 
-    chunks: list[RetrievedChunk] = store.retrieve(
-        query, user_id=user_id,
-        top_k=strategy["top_k"], top_n=strategy["top_n"],
-    )
+    # ── 第一次检索 ─────────────────────────────────────────────────────
+    with TraceContext(
+        name="retrieve.vector_search",
+        metadata={"query_type": query_type, "top_k": strategy["top_k"],
+                   "top_n": strategy["top_n"], "attempt": 1},
+    ) as ret_span:
+        chunks: list[RetrievedChunk] = store.retrieve(
+            query, user_id=user_id,
+            top_k=strategy["top_k"], top_n=strategy["top_n"],
+        )
+        ret_span.update(
+            metadata={
+                "result_count": len(chunks),
+                "avg_score": (sum(c.score for c in chunks) / len(chunks)
+                              if chunks else 0),
+                "max_score": (max(c.score for c in chunks) if chunks else 0),
+            },
+        )
 
     ok, reason = RetrievalCritic.evaluate(chunks)
     if not ok:
         revised = RetrievalCritic.reformulate(query, reason)
         if revised and revised != query:
-            chunks = store.retrieve(
-                revised, user_id=user_id,
-                top_k=max(strategy["top_k"], 30),
-                top_n=strategy["top_n"],
-            )
+            # ── 改写重检 ─────────────────────────────────────────────
+            with TraceContext(
+                name="retrieve.reformulate_retry",
+                input_data=scrub_content(revised)[:300],
+                metadata={"original_query": scrub_content(query)[:200],
+                          "reformulated": scrub_content(revised)[:200],
+                          "reason": reason},
+            ) as retry_span:
+                chunks = store.retrieve(
+                    revised, user_id=user_id,
+                    top_k=max(strategy["top_k"], 30),
+                    top_n=strategy["top_n"],
+                )
+                retry_span.update(
+                    metadata={
+                        "result_count": len(chunks),
+                        "avg_score": (sum(c.score for c in chunks) / len(chunks)
+                                      if chunks else 0),
+                        "max_score": (max(c.score for c in chunks) if chunks else 0),
+                    },
+                )
 
     return chunks, query_type, reason
 

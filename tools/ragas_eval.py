@@ -65,7 +65,7 @@ def retrieve_agentic(query: str) -> list[str]:
 
 def _build_judge_components():
     """创建 RAGAS judge LLM + evaluator embeddings。生成器由 FinanceAgent 负责。"""
-    api_key = os.environ.get("DEEPSEEK_API_KEY")
+    api_key = "sk-fc5bb6f337e34bb89aac03801746e773"
     if not api_key:
         raise RuntimeError(
             "DEEPSEEK_API_KEY 环境变量未设置。请设置后再运行。\n"

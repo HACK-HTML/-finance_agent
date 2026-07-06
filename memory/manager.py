@@ -18,7 +18,7 @@ MemoryManager —— Mem0 跨会话记忆封装
 from __future__ import annotations
 
 import threading
-from typing import Optional
+
 
 
 class MemoryManager:
