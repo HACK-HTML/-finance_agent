@@ -5,4 +5,5 @@ __pycache__/
 *.txt
 *.bin
 .claude
-.env
+storage
+course
