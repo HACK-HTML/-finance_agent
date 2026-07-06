@@ -4,6 +4,8 @@
 """
 
 import sys
+import uuid
+
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 import asyncio
@@ -52,7 +54,7 @@ def run_demo(agent: FinanceAgent):
 
 async def main():
     print(WELCOME)
-    agent = FinanceAgent()
+    agent = FinanceAgent(session_id=str(uuid.uuid4()),user_id=str('wangke'))
 
     while True:
         try:
@@ -89,7 +91,8 @@ async def main():
             from tools.rag_pipeline import get_store
             path = parts[1].strip().strip('"').strip("'")
             try:
-                stats = get_store().ingest_pdf(path, session_id=agent.session_id)
+                stats = get_store().ingest_pdf(path, user_id=agent.user_id,
+                                               session_id=agent.session_id)
                 print(f"✅ 文档已入库：{stats}")
             except Exception as e:
                 print(f"❌ 入库失败：{e}")

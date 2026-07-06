@@ -9,7 +9,7 @@ import random
 import math
 from datetime import datetime
 from typing import Callable, Any
-from models.schemas import BudgetCritique
+
 from tools.budget_plan import _initial_ratios, _compute_plan, _critique_plan, _render_plan
 # ★ Week1 Day1-2：把 Agentic RAG 检索作为标准工具接入
 from tools.retrieve_tool import retrieve_document, RETRIEVE_DOCUMENT_SCHEMA

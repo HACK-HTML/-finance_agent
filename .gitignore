@@ -4,3 +4,5 @@ __pycache__/
 *.csv
 *.txt
 *.bin
+.claude
+.env

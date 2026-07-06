@@ -3,8 +3,10 @@
 
 """
 import json
+import time
 from pydantic import BaseModel, Field
 from models.schemas import BudgetCritique
+from tools.tracing import get_langfuse_client, scrub_content
 import re
 # ── 1. 解析负债字符串里的金额 ──
 def _parse_obligations(text: str) -> float:
@@ -135,15 +137,36 @@ def _critique_plan(client, plan: dict) -> BudgetCritique:
         "只返回符合以下 JSON Schema 的内容，不要额外文字：\n"
         f"{json.dumps(schema, ensure_ascii=False)}"
     )
+    lf = get_langfuse_client()
     try:
+        t_start = time.time()
         resp = client.messages.create(
-            model="deepseek-v4-pro", max_tokens=1024*8,
+            model="deepseek-v4-pro", max_tokens=1024 * 8,
             messages=[{"role": "user", "content": prompt}],
         )
+        gen_ms = round((time.time() - t_start) * 1000)
         text = resp.content[1].text.strip().replace("```json", "").replace("```", "").strip()
+
+        # ── LangFuse Generation ──────────────────────────────────────────────
+        if lf is not None:
+            try:
+                lf_gen = lf.start_observation(
+                    name="llm.budget_critic",
+                    as_type="generation",
+                    model="deepseek-v4-pro",
+                    input=scrub_content(prompt)[:500],
+                    metadata={
+                        "input_chars": len(prompt),
+                        "output_chars": len(text),
+                        "duration_ms": gen_ms,
+                    },
+                )
+                lf_gen.update(output=scrub_content(text)[:500])
+                lf_gen.end()
+            except Exception:
+                pass
+
         return BudgetCritique.model_validate_json(text)
     except Exception as e:
         print(f"[critic解析失败，放行] {e}")
         return BudgetCritique(ok=True, issues=[])
-
-

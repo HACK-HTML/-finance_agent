@@ -8,7 +8,7 @@ import os
 import shutil
 import asyncio
 import tempfile
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import json
@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from core.agent import FinanceAgent
 from tools.rag_pipeline import get_store
+from tools.tracing import get_langfuse_client, scrub_content
 
 app = FastAPI(
     title="💰 个人财务 Agent API",
@@ -29,6 +30,43 @@ app = FastAPI(
 
 # 内存中维护多个会话（生产环境应用 Redis）
 sessions: dict[str, FinanceAgent] = {}
+
+
+# ── LangFuse HTTP 中间件 ───────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def langfuse_middleware(request: Request, call_next):
+    """为每个 HTTP 请求创建 LangFuse observation 上下文，注入到 FinanceAgent 中。"""
+    lf = get_langfuse_client()
+    lf_trace = None
+    if lf is not None:
+        try:
+            lf_trace = lf.start_observation(
+                name=f"api.{request.method} {request.url.path}",
+                as_type="span",
+                input=scrub_content(request.url.path),
+                metadata={
+                    "method": request.method,
+                    "user_agent": request.headers.get("user-agent", ""),
+                    "ip": (request.client.host if request.client else ""),
+                },
+            )
+        except Exception:
+            pass
+    request.state.langfuse_trace = lf_trace
+
+    response = await call_next(request)
+
+    if lf_trace is not None:
+        try:
+            lf_trace.update(
+                output=f"status={response.status_code}",
+                metadata={"status_code": response.status_code},
+            )
+            lf_trace.end()
+        except Exception:
+            pass
+    return response
 
 
 # ── 请求/响应模型 ──────────────────────────────────────────────────────────────
@@ -66,7 +104,7 @@ def root():
 
 
 @app.post("/chat", response_model=ChatResponse, summary="发送消息给 Agent")
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, request: Request):
     """
     主要对话接口。
     - session_id 不传时自动创建新会话
@@ -75,7 +113,11 @@ async def chat(req: ChatRequest):
     # 获取或创建会话
     sid = req.session_id or str(uuid.uuid4())
     if sid not in sessions:
-        sessions[sid] = FinanceAgent(session_id=sid, user_id=req.user_id or sid)
+        lf_trace = getattr(request.state, 'langfuse_trace', None)
+        sessions[sid] = FinanceAgent(
+            session_id=sid, user_id=req.user_id or sid,
+            _langfuse_trace=lf_trace,
+        )
         print(f"[新会话] {sid}  (user={req.user_id or sid})")
 
     agent = sessions[sid]
@@ -92,7 +134,7 @@ async def chat(req: ChatRequest):
 
 
 @app.post("/upload", summary="上传 PDF 文档进入指定用户的知识库")
-async def upload(file: UploadFile = File(...), session_id: str | None = Form(None),
+async def upload(request: Request, file: UploadFile = File(...), session_id: str | None = Form(None),
                  user_id: str | None = Form(None)):
     """
     用户上传 PDF → 切块 + 向量化 → 写入该用户的 Qdrant 知识库。
@@ -101,7 +143,11 @@ async def upload(file: UploadFile = File(...), session_id: str | None = Form(Non
     sid = session_id or str(uuid.uuid4())
     uid = user_id or sid
     if sid not in sessions:
-        sessions[sid] = FinanceAgent(session_id=sid, user_id=uid)
+        lf_trace = getattr(request.state, 'langfuse_trace', None)
+        sessions[sid] = FinanceAgent(
+            session_id=sid, user_id=uid,
+            _langfuse_trace=lf_trace,
+        )
 
     # 落到临时文件再交给 ingest（pypdf 需要文件路径）
     suffix = os.path.splitext(file.filename or "doc.pdf")[1] or ".pdf"

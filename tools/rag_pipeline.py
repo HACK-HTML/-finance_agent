@@ -30,6 +30,8 @@ from typing import Optional, Iterable
 from qdrant_client import QdrantClient, models
 
 
+
+
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 @dataclass
 class RAGConfig:
@@ -45,7 +47,7 @@ class RAGConfig:
 
     # 模型
     embed_model: str = field(
-        default_factory=lambda: os.getenv("RAG_EMBED_MODEL", "BAAI/bge-base-zh-v1.5")
+        default_factory=lambda: os.getenv("RAG_EMBED_MODEL", "BAAI/bge-small-zh-v1.5")
     )
     rerank_model: str = field(
         default_factory=lambda: os.getenv("RAG_RERANK_MODEL", "BAAI/bge-reranker-base")
@@ -219,7 +221,10 @@ class DocumentStore:
 
     def __init__(self, config: Optional[RAGConfig] = None):
         self.cfg = config or RAGConfig()
-        self.client = QdrantClient(location=self.cfg.qdrant_location)
+        if self.cfg.qdrant_location == ":memory:":
+            self.client = QdrantClient(location=":memory:")
+        else:
+            self.client = QdrantClient(path=self.cfg.qdrant_location)
         self.embedder = _Embedder(self.cfg.embed_model, self.cfg.query_instruction)
         self.reranker = _Reranker(self.cfg.rerank_model)
         self._lock = threading.Lock()
