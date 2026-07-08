@@ -2,13 +2,16 @@
 核心 Agent — 手写 ReAct 循环，无任何框架依赖
 ReAct = Reasoning + Acting，每步：Think → Act（调用工具）→ Observe（看结果）→ 重复
 """
+import asyncio
+import json
 import os
 import time
-from pprint import pprint
 from functools import partial
-import json
+from pprint import pprint
+from typing import Any
+
 import anthropic
-import asyncio
+
 from models.schemas import AgentState, ToolCall, ToolResult, ConversationTurn, MonthlyReport
 from tools.registry import TOOL_REGISTRY, TOOL_SCHEMAS, generate_budget_plan, retrieve_document, memory_recall
 from tools.tracing import get_langfuse_client, TraceContext, scrub_content
@@ -25,8 +28,8 @@ def _require_env(name: str) -> str:
         )
     return val
 
-API_KEY = "sk-6e1028b8517e4cf79735955e4b7733dd"
-API_CRITIC_KEY = "sk-f4acd747610446d5a03e361f4a800b7d"
+API_KEY = _require_env("DEEPSEEK_API_KEY")
+API_CRITIC_KEY = os.getenv("DEEPSEEK_API_KEY", API_KEY)
 
 MODEL='deepseek-v4-pro'
 BASE_URL = 'https://api.deepseek.com/anthropic'
@@ -57,7 +60,7 @@ SYSTEM_PROMPT = f"""你是一个专业的个人财务分析助手。你能帮用
 # ── ReAct 核心循环 ────────────────────────────────────────────────────────────
 class FinanceAgent:
     def __init__(self, session_id: str = "default", user_id: str | None = None,
-                 _langfuse_trace=None):
+                 _langfuse_trace: Any = None):
         self.session_id = session_id          # 会话维度（消息历史 / 文档上传）
         self.user_id = user_id or session_id  # 用户维度（记忆 + 文档检索，跨会话共享）
         self.client = anthropic.Anthropic(api_key=API_KEY, base_url=BASE_URL)
@@ -81,6 +84,36 @@ class FinanceAgent:
         results = self.memory.search(user_input)
         summary = self.memory.format_summary(results)
         return SYSTEM_PROMPT + "\n\n## 用户记忆摘要\n" + summary
+
+    # ── Helpers ─────────────────────────────────────────────────────────────────
+
+    def _store_memory(self, user_input: str, final_text: str) -> None:
+        """异步存储对话记忆（fire-and-forget，不阻塞回答返回）。"""
+        asyncio.create_task(
+            asyncio.to_thread(
+                self.memory.add_async,
+                f"用户：{user_input}\n助手：{final_text}",
+            )
+        )
+
+    def _finalize_trace(self, lf_trace: Any, final_text: str,
+                        iteration: int, t_start: float,
+                        stop_reason: str = "end_turn") -> None:
+        """统一收尾 LangFuse trace，更新输出和元数据后 end。"""
+        if lf_trace is None:
+            return
+        try:
+            lf_trace.update(
+                output=scrub_content(final_text)[:500],
+                metadata={
+                    "total_iterations": iteration,
+                    "stop_reason": stop_reason,
+                    "total_duration_ms": round((time.time() - t_start) * 1000),
+                },
+            )
+            lf_trace.end()
+        except Exception:
+            pass
 
     # ── 对话入口 ────────────────────────────────────────────────────────────────
 
@@ -134,7 +167,8 @@ class FinanceAgent:
         final_text = "已达到最大推理轮数，请简化问题后重试。"
 
         while iteration < MAX_ITERATIONS:
-            pprint(self.state.messages)
+            if os.environ.get("DEBUG"):
+                pprint(self.state.messages)
 
             iteration += 1
             print(f"\n{'─'*50}")
@@ -214,27 +248,8 @@ class FinanceAgent:
                         },
                     )
 
-                    # ★ 异步存储记忆：fire-and-forget，不阻塞回答返回
-                    asyncio.create_task(
-                        asyncio.to_thread(
-                            self.memory.add_async,
-                            f"用户：{user_input}\n助手：{final_text}"
-                        )
-                    )
-                    if lf_trace is not None:
-                        try:
-                            lf_trace.update(
-                                output=scrub_content(final_text)[:500],
-                                metadata={
-                                    "total_iterations": iteration,
-                                    "total_duration_ms": round(
-                                        (time.time() - t_start) * 1000
-                                    ),
-                                },
-                            )
-                            lf_trace.end()
-                        except Exception:
-                            pass
+                    self._store_memory(user_input, final_text)
+                    self._finalize_trace(lf_trace, final_text, iteration, t_start)
                     return final_text
 
                 # tool_use = Claude 决定调用一个或多个工具
@@ -259,42 +274,19 @@ class FinanceAgent:
 
                 # 兜底：其他停止原因直接取文本
                 final_text = llm_text
-                asyncio.create_task(
-                    asyncio.to_thread(
-                        self.memory.add_async,
-                        f"用户：{user_input}\n助手：{final_text}"
-                    )
-                )
-                if lf_trace is not None:
-                    try:
-                        lf_trace.update(output=scrub_content(final_text)[:500])
-                        lf_trace.end()
-                    except Exception:
-                        pass
+                self._store_memory(user_input, final_text)
+                self._finalize_trace(lf_trace, final_text, iteration, t_start)
                 return final_text
 
 
         # 循环耗尽 MAX_ITERATIONS —— 安全截断
-        if lf_trace is not None:
-            try:
-                lf_trace.update(
-                    output=scrub_content(final_text)[:500],
-                    metadata={
-                        "total_iterations": iteration,
-                        "stop_reason": "max_iterations",
-                        "total_duration_ms": round(
-                            (time.time() - t_start) * 1000
-                        ),
-                    },
-                )
-                lf_trace.end()
-            except Exception:
-                pass
+        self._finalize_trace(lf_trace, final_text, iteration, t_start,
+                             stop_reason="max_iterations")
         return final_text
 
     # ── 工具执行 ────────────────────────────────────────────────────────────────
 
-    async def _execute_single_tool(self, block, parent=None) -> tuple[ToolCall, str]:
+    async def _execute_single_tool(self, block: Any, parent: Any = None) -> tuple[ToolCall, str]:
         """执行单个工具调用，返回 (调用记录, 结果字符串)。永不抛异常。"""
         tool_call = ToolCall(
             tool_use_id=block.id,
@@ -337,7 +329,7 @@ class FinanceAgent:
         print(f"[工具结果] {str(result_content)[:200]}")
         return tool_call, str(result_content)
 
-    async def _execute_tools(self, content_blocks: list, parent=None) -> list[dict]:
+    async def _execute_tools(self, content_blocks: list[Any], parent: Any = None) -> list[dict[str, Any]]:
         """
         并发执行 Claude 响应中的所有 tool_use 块。
         返回格式符合 Anthropic API 规范的 tool_result 列表（顺序与输入一致）。
@@ -364,7 +356,7 @@ class FinanceAgent:
 
         return tool_results
 
-    def _extract_text(self, content_blocks: list) -> str:
+    def _extract_text(self, content_blocks: list[Any]) -> str:
         """从响应内容块中提取纯文本"""
         texts = [b.text for b in content_blocks if hasattr(b, "text")]
         return "\n".join(texts) if texts else "（无文本输出）"

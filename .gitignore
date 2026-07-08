@@ -1,8 +1,11 @@
 .venv
 .idea
 __pycache__/
-*.csv
-*.txt
-*.bin
 .claude
+storage
+course
 .env
+*.pyc
+*.bin
+*计划*.md
+claude-code-docs.md

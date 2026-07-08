@@ -3,11 +3,14 @@
 
 """
 import json
+import re
 import time
+from typing import Any
+
 from pydantic import BaseModel, Field
+
 from models.schemas import BudgetCritique
 from tools.tracing import get_langfuse_client, scrub_content
-import re
 # ── 1. 解析负债字符串里的金额 ──
 def _parse_obligations(text: str) -> float:
     """从 '每月还款2000'、'房租1500'、'车贷3000' 等提取数字金额，多项求和。"""
@@ -18,9 +21,10 @@ def _parse_obligations(text: str) -> float:
 
 
 # ── 2. 计算内核：先扣负债，再分配剩余；储蓄细分可调 ──
-def _compute_plan(monthly_income, needs_pct, wants_pct, savings_pct, strategy_base,
-                  financial_goal, current_obligations="",
-                  savings_split=(0.4, 0.4, 0.2), extra_debt_payment=0.0):
+def _compute_plan(monthly_income: float, needs_pct: float, wants_pct: float, savings_pct: float,
+                  strategy_base: str, financial_goal: str, current_obligations: str = "",
+                  savings_split: tuple[float, float, float] = (0.4, 0.4, 0.2),
+                  extra_debt_payment: float = 0.0) -> dict[str, Any]:
     obligation = _parse_obligations(current_obligations)
     disposable = max(monthly_income - obligation - extra_debt_payment, 0)
 
@@ -78,7 +82,7 @@ def _compute_plan(monthly_income, needs_pct, wants_pct, savings_pct, strategy_ba
         "categories": categories,
     }
 # ── 根据真实占比生成诚实的策略标签 ──
-def _label_from_actual(actual, financial_goal, base):
+def _label_from_actual(actual: dict[str, float], financial_goal: str, base: str) -> str:
     net = actual["net_improvement_rate"]        # 储蓄+偿债 的总资产改善率
     if actual["extra_debt_rate"] > 0 or "还债" in financial_goal or "债务" in financial_goal:
         return f"还债优先型（净资产改善率{net:.0%}）"
@@ -114,7 +118,7 @@ def _render_plan(plan: dict) -> str:
     lines.append(f"  {'合计':<18} ¥{total:>8,.0f}  {total/income*100:>5.1f}%")
     return "\n".join(lines)
 # ── 4. get budget plan 初始比例：沿用原来的关键词逻辑 ──
-def _initial_ratios(goal: str):
+def _initial_ratios(goal: str) -> tuple[float, float, float, str]:
     g = goal.lower()
     if "买房" in g or "存钱" in g or "储蓄" in g:
         return 0.45, 0.20, 0.35, "激进储蓄型"
@@ -123,7 +127,7 @@ def _initial_ratios(goal: str):
     else:
         return 0.50, 0.30, 0.20, "均衡发展型"
 # ── 5. LLM Critic：评审 + 给出调整后的比例（结构化输出）──
-def _critique_plan(client, plan: dict) -> BudgetCritique:
+def _critique_plan(client: Any, plan: dict[str, Any]) -> BudgetCritique:
     schema = BudgetCritique.model_json_schema()
     prompt = (
         "你是严格的个人理财审查员。审查以下预算是否合理，重点检查：\n"
@@ -169,4 +173,70 @@ def _critique_plan(client, plan: dict) -> BudgetCritique:
         return BudgetCritique.model_validate_json(text)
     except Exception as e:
         print(f"[critic解析失败，放行] {e}")
+        return BudgetCritique(ok=True, issues=[])
+
+
+# ── 6. LLM Self-Reflection：自我审视预算方案，找出弱点并改进 ──
+def _reflect_on_plan(client: Any, plan_text: str, income: float, goal: str) -> BudgetCritique:
+    """
+    让 LLM 以「自我反思」角色审视已生成的预算方案文本，找出弱点并给出改进建议。
+
+    与 _critique_plan() 的区别：
+    - _critique_plan(): 外部审查员视角，接收原始 dict 数据，只给数值参数调整
+    - _reflect_on_plan(): 自我反思视角，接收渲染好的方案文本，审视逻辑合理性、
+      分类金额是否与目标匹配、建议是否具体可操作
+
+    返回 BudgetCritique，ok=True 表示方案无需进一步修改。
+    """
+    schema = BudgetCritique.model_json_schema()
+    prompt = (
+        "你是一位经验丰富的个人理财顾问。你刚刚为一位客户生成了以下预算方案。\n"
+        "现在请你以「自我反思」的角度重新审视这份方案——就像你在检查自己刚完成的工作。\n\n"
+        f"客户背景：月收入 ¥{income:,.0f}，理财目标「{goal}」\n\n"
+        f"你生成的预算方案：\n{plan_text}\n\n"
+        "请诚实地回答以下问题：\n"
+        "① 储蓄率是否与客户的收入水平和目标匹配？（储蓄率≥15%算合理，激进目标应≥30%）\n"
+        "② 分类金额是否具体、可操作？（用户看完知道每项该花多少钱）\n"
+        "③ 方案是否紧扣客户的理财目标？（买房目标应有高 goal 专项存款比例，还债目标应有加速偿债）\n"
+        "④ 是否有逻辑矛盾或数字错误？（各项占比是否自洽）\n\n"
+        "基于以上审视，给出：\n"
+        "- ok=true 如果方案质量已合格，无需修改；ok=false 则列出 issues 和具体的改进建议\n"
+        "- 如果需要调整三大类比例，填 suggested_ratios\n"
+        "- 如果需要调整储蓄内部权重（应急/投资/专项），填 suggested_savings_split\n"
+        "- 如果有债务，建议的额外加速偿债金额填 suggested_extra_debt\n\n"
+        "只返回符合以下 JSON Schema 的内容，不要额外文字：\n"
+        f"{json.dumps(schema, ensure_ascii=False)}"
+    )
+    lf = get_langfuse_client()
+    try:
+        t_start = time.time()
+        resp = client.messages.create(
+            model="deepseek-v4-pro", max_tokens=1024 * 8,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        gen_ms = round((time.time() - t_start) * 1000)
+        text = resp.content[1].text.strip().replace("```json", "").replace("```", "").strip()
+
+        # ── LangFuse Generation ──────────────────────────────────────────────
+        if lf is not None:
+            try:
+                lf_gen = lf.start_observation(
+                    name="llm.budget_reflection",
+                    as_type="generation",
+                    model="deepseek-v4-pro",
+                    input=scrub_content(prompt)[:500],
+                    metadata={
+                        "input_chars": len(prompt),
+                        "output_chars": len(text),
+                        "duration_ms": gen_ms,
+                    },
+                )
+                lf_gen.update(output=scrub_content(text)[:500])
+                lf_gen.end()
+            except Exception:
+                pass
+
+        return BudgetCritique.model_validate_json(text)
+    except Exception as e:
+        print(f"[reflection解析失败，放行] {e}")
         return BudgetCritique(ok=True, issues=[])

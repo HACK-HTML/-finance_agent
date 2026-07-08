@@ -1,0 +1,53 @@
+[project]
+name = "finance-agent"
+version = "1.0.0"
+description = "Personal financial analysis AI Agent — hand-coded ReAct loop"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [
+    { name = "KeWang" },
+]
+keywords = [
+    "ai-agent",
+    "react",
+    "rag",
+    "llm",
+    "personal-finance",
+    "langfuse",
+    "mem0",
+    "qdrant",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "anthropic>=0.39.0",
+    "pydantic>=2.0.0",
+    "fastapi>=0.110.0",
+    "uvicorn[standard]>=0.27.0",
+    "qdrant-client>=1.7.0",
+    "fastembed>=0.3.0",
+    "pypdf>=4.0.0",
+    "fpdf2>=2.7.0",
+    "mem0ai>=0.1.0",
+    "langfuse>=2.0.0",
+]
+
+[project.optional-dependencies]
+eval = [
+    "ragas>=0.2.0",
+    "langchain-openai>=0.2.0",
+]
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["core*", "models*", "tools*", "memory*"]

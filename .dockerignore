@@ -1,0 +1,29 @@
+# ── Python artifacts ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+
+# ── Git & CI ──
+.git/
+.gitignore
+.github/
+
+# ── Storage (will be volumes at runtime) ──
+storage/
+
+# ── Dev/test files ──
+test.py
+generate_financial_pdf.py
+generate_product_pdf.py
+course/
+
+# ── Documentation ──
+*.md
+claude-code-docs.md
+Week2_Day10-11_LangFuse可观测性接入计划.md
+
+# ── Environment (passed at runtime) ──
+.env
+.env.example

@@ -26,14 +26,15 @@ LangFuse 可观测性基础设施 —— 零侵入包装层
 """
 from __future__ import annotations
 
+import os
 import re
 import time
 from contextlib import contextmanager
 from typing import Any
 
-LANGFUSE_SECRET_KEY="sk-lf-c31251b3-e52a-479c-8e7a-c1d1875a37ad"
-LANGFUSE_PUBLIC_KEY="pk-lf-b086c3d9-ef66-4606-acb7-dcedec6dea02"
-LANGFUSE_BASE_URL="https://jp.cloud.langfuse.com"
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_BASE_URL = os.getenv("LANGFUSE_HOST", "")
 # ── PII scrubbing ─────────────────────────────────────────────────────────────
 
 # Patterns to redact before sending content to observability platforms
