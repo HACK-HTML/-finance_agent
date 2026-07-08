@@ -3,8 +3,8 @@
 目的：学习如何用 Pydantic 验证 LLM 的结构化输出，防止脏数据进入业务逻辑
 """
 
-from pydantic import BaseModel, Field, field_validator
-from typing import Any
+from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import Any, Optional
 from datetime import datetime
 
 
@@ -83,11 +83,8 @@ class MemorySummary(BaseModel):
     recalled_at: datetime = Field(default_factory=datetime.now)
 
 
-from pydantic import BaseModel, Field, model_validator
-from typing import Optional
-
-
 class SuggestedRatios(BaseModel):
+    """修正后的三大类支出比例建议（needs/wants/savings），由 BudgetCritic 返回。"""
     needs: float = Field(ge=0, le=1)
     wants: float = Field(ge=0, le=1)
     savings: float = Field(ge=0, le=1)

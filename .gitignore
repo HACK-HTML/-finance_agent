@@ -7,3 +7,5 @@ course
 *.csv
 *.txt
 *.bin
+*.md
+!README.md

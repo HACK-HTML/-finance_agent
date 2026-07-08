@@ -10,10 +10,13 @@ import math
 from datetime import datetime
 from typing import Callable, Any
 
-from tools.budget_plan import _initial_ratios, _compute_plan, _critique_plan, _render_plan
+from tools.budget_plan import (_initial_ratios, _compute_plan, _critique_plan, _render_plan,
+                              _reflect_on_plan)
 # ★ Week1 Day1-2：把 Agentic RAG 检索作为标准工具接入
 from tools.retrieve_tool import retrieve_document, RETRIEVE_DOCUMENT_SCHEMA
 
+# ── 常量 ──────────────────────────────────────────────────────────────────────
+MAX_BUDGET_REVISIONS = 2
 
 # ── 1. 财务计算工具 ────────────────────────────────────────────────────────────
 
@@ -142,11 +145,39 @@ def evaluate_financial_health(
     return "\n".join(lines)
 
 
-# ── 5. 对外工具：自带反思循环，返回已审查的最终方案 ──
-MAX_BUDGET_REVISIONS = 2
+# ── 2. 预算计划工具（含 Reflection 循环）────────────────────────────────────────
 
-def generate_budget_plan(monthly_income, financial_goal="平衡储蓄与生活质量",
-                         current_obligations="", _client=None):
+def _compare_plans(v1: dict[str, Any], v2: dict[str, Any]) -> dict[str, Any]:
+    """比较两个版本的预算方案，返回更好的那个。
+
+    比较维度：① 储蓄率是否在合理范围（15-50%）② 净改善率是否更高 ③ v2 是否有实质性变化。
+    """
+    a1, a2 = v1["actual"], v2["actual"]
+    # 储蓄率合理性：0.15-0.50 为理想区间
+    v1_sav_ok = 0.15 <= a1["savings_rate"] <= 0.50
+    v2_sav_ok = 0.15 <= a2["savings_rate"] <= 0.50
+    if v2_sav_ok and not v1_sav_ok:
+        return v2
+    if v1_sav_ok and not v2_sav_ok:
+        return v1
+    # 净改善率（储蓄+偿债）越高越好
+    if a2["net_improvement_rate"] > a1["net_improvement_rate"] + 0.02:
+        return v2
+    return v1  # 默认保留 v1（保守策略）
+
+
+def generate_budget_plan(monthly_income: float, financial_goal: str = "平衡储蓄与生活质量",
+                         current_obligations: str = "", _client: Any = None) -> str:
+    """生成预算方案，含 Reflection 自我修正循环。
+
+    流程：
+    1. _initial_ratios() → 初始参数
+    2. _compute_plan() → v1
+    3. _critique_plan(v1) → 外部审查 + 数值调整 → v2（可选）
+    4. _render_plan(v2) → 渲染文本
+    5. _reflect_on_plan(文本) → LLM 自我反思 → v3（可选）
+    6. _compare_plans() → 保留最佳版本
+    """
     needs_pct, wants_pct, savings_pct, strategy = _initial_ratios(financial_goal)
     split = (0.4, 0.4, 0.2)
     extra_debt = 0.0
@@ -154,8 +185,11 @@ def generate_budget_plan(monthly_income, financial_goal="平衡储蓄与生活�
                          strategy, financial_goal, current_obligations,
                          savings_split=split, extra_debt_payment=extra_debt)
 
-    review_log = []
+    review_log: list[str] = []
+    reflection_log: list[dict[str, Any]] = []
+
     if _client is not None:
+        # ── 阶段 1：外部 Critic 审查（数值参数调整）─────────────────────────
         for attempt in range(MAX_BUDGET_REVISIONS):
             critique = _critique_plan(_client, plan)
             has_change = any([critique.suggested_ratios,
@@ -163,7 +197,7 @@ def generate_budget_plan(monthly_income, financial_goal="平衡储蓄与生活�
                               critique.suggested_extra_debt is not None])
             if critique.ok or not has_change:
                 if not critique.ok:
-                    review_log.append(f"第{attempt+1}轮发现问题但无有效调整方案")
+                    review_log.append(f"Critic第{attempt+1}轮发现问题但无有效调整方案")
                 break
 
             if critique.suggested_ratios:
@@ -175,18 +209,57 @@ def generate_budget_plan(monthly_income, financial_goal="平衡储蓄与生活�
             if critique.suggested_extra_debt is not None:
                 extra_debt = critique.suggested_extra_debt
 
-            review_log.append(f"第{attempt+1}轮调整：{'; '.join(critique.issues)}")
+            review_log.append(f"Critic第{attempt+1}轮：{'; '.join(critique.issues)}")
             plan = _compute_plan(monthly_income, needs_pct, wants_pct, savings_pct,
                                  strategy + "·已优化", financial_goal, current_obligations,
                                  savings_split=split, extra_debt_payment=extra_debt)
 
+        # ── 阶段 2：Self-Reflection（审视渲染后的方案文本）─────────────────
+        plan_v1_text = _render_plan(plan)
+        plan_v1 = plan
+        reflection = _reflect_on_plan(_client, plan_v1_text, monthly_income, financial_goal)
+        if not reflection.ok:
+            has_change = any([reflection.suggested_ratios,
+                              reflection.suggested_savings_split,
+                              reflection.suggested_extra_debt is not None])
+            if has_change:
+                if reflection.suggested_ratios:
+                    r = reflection.suggested_ratios
+                    needs_pct, wants_pct, savings_pct = r.needs, r.wants, r.savings
+                if reflection.suggested_savings_split:
+                    s = reflection.suggested_savings_split
+                    split = (s.emergency, s.investment, s.goal)
+                if reflection.suggested_extra_debt is not None:
+                    extra_debt = reflection.suggested_extra_debt
+
+                plan_v2 = _compute_plan(monthly_income, needs_pct, wants_pct, savings_pct,
+                                        strategy + "·Reflection优化", financial_goal,
+                                        current_obligations,
+                                        savings_split=split, extra_debt_payment=extra_debt)
+                reflection_log.append({
+                    "version": 1, "critique_issues": reflection.issues,
+                    "improvements": (
+                        [f"ratios→{reflection.suggested_ratios}" if reflection.suggested_ratios else "",
+                         f"split→{reflection.suggested_savings_split}" if reflection.suggested_savings_split else "",
+                         f"extra_debt→{reflection.suggested_extra_debt}" if reflection.suggested_extra_debt is not None else ""]
+                    ),
+                })
+                plan = _compare_plans(plan_v1, plan_v2)
+                winner = "v2" if plan is plan_v2 else "v1"
+                reflection_log[-1]["winner"] = winner
+                review_log.append(f"Reflection：{'; '.join(reflection.issues)}（采纳{winner}）")
+            else:
+                review_log.append("Reflection确认方案已合格，无需进一步修改")
+
     if review_log:
         print("[budget review log]", " | ".join(review_log))
+    if reflection_log:
+        plan["_reflection_log"] = reflection_log
 
     return _render_plan(plan)
 
 
-# ── 2. 市场数据工具（模拟）──────────────────────────────────────────────────────
+# ── 3. 市场数据工具（模拟）──────────────────────────────────────────────────────
 
 def get_exchange_rate(from_currency: str, to_currency: str) -> str:
     """获取汇率（模拟数据，真实项目接外部 API）。"""
@@ -245,9 +318,9 @@ def get_fund_info(fund_code: str) -> str:
     )
 
 
-# ── 6. 记忆检索工具 ★ Week1 Day3-4 ─────────────────────────────────────────────
+# ── 4. 记忆检索工具 ★ Week1 Day3-4 ─────────────────────────────────────────────
 
-def memory_recall(query: str, *, _memory=None) -> str:
+def memory_recall(query: str, *, _memory: Any = None) -> str:
     """
     检索当前用户的持久记忆，返回与查询相关的完整记忆内容。
 
@@ -303,7 +376,7 @@ MEMORY_RECALL_SCHEMA = {
 }
 
 
-# ── 3. 工具注册表 ──────────────────────────────────────────────────────────────
+# ── 5. 工具注册表 ──────────────────────────────────────────────────────────────
 
 TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
     "calculate":                calculate,
@@ -317,7 +390,7 @@ TOOL_REGISTRY: dict[str, Callable[..., Any]] = {
 }
 
 
-# ── 4. 工具 Schema ─────────────────────────────────────────────────────────────
+# ── 6. 工具 Schema ─────────────────────────────────────────────────────────────
 
 TOOL_SCHEMAS = [{
     "name": "calculate",

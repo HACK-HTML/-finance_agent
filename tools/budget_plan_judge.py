@@ -2,17 +2,18 @@
 10 个测试用例跑 Eval，对比 Reflection 前后输出质量
 用 LLM-as-Judge 给 Rubric 评分（储蓄率合理/建议可操作/数字正确），记录有 Reflection vs 无 Reflection 的评分差
 """
-import os
 import json
+import os
 import re
-import anthropic
 from statistics import mean
-from pydantic import BaseModel,Field
-from tools.registry import generate_budget_plan
-from budget_plan_testcase import TEST_CASES
 
-API_CRITIC_KEY = 'sk-33d367956a054b1c8f5870667ff821d6'
-API_JUDGE_KEY = 'sk-301a24d67a474f20a54e7431d048b823'
+import anthropic
+from pydantic import BaseModel, Field
+from tools.registry import generate_budget_plan
+from tools.budget_plan_testcase import TEST_CASES
+
+API_CRITIC_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+API_JUDGE_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 BASE_URL = 'https://api.deepseek.com/anthropic'
 # ──  LLM as judge 的评分标准──
 class JudgeScore(BaseModel):
@@ -27,7 +28,6 @@ class JudgeScore(BaseModel):
     goal_reason: str = Field(description="给该分数的简短理由")
 
 # ── 数字正确性：代码硬核验证，不交给 LLM ──
-import re
 
 def check_numerical_correctness(plan_text, monthly_income):
     # 只匹配明细行：¥金额 后面紧跟 百分比（标题/审查记录没有这个模式）

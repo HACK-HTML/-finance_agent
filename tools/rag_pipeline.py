@@ -103,6 +103,7 @@ def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
 
 
 def _recursive_split(text: str, separators: list[str], chunk_size: int) -> list[str]:
+    """按分隔符优先级递归切分文本，超长块降级到更细分隔符直至硬切。"""
     if len(text) <= chunk_size:
         return [text] if text.strip() else []
 
@@ -155,7 +156,7 @@ class _Embedder:
         self._model = None
         self._dim: Optional[int] = None
 
-    def _ensure(self):
+    def _ensure(self) -> None:
         if self._model is None:
             from fastembed import TextEmbedding
             self._model = TextEmbedding(self.model_name)
@@ -189,7 +190,7 @@ class _Reranker:
         self.model_name = model_name
         self._model = None
 
-    def _ensure(self):
+    def _ensure(self) -> None:
         if self._model is None:
             from fastembed.rerank.cross_encoder import TextCrossEncoder
             self._model = TextCrossEncoder(self.model_name)
@@ -207,6 +208,7 @@ class _Reranker:
 # ── 4. 文档库：ingest（建库）+ retrieve（两阶段检索）─────────────────────────────
 @dataclass
 class RetrievedChunk:
+    """一次检索返回的文档片段，含来源、页码和相关性分数。"""
     text: str
     source: str
     page: int
@@ -230,7 +232,7 @@ class DocumentStore:
         self._lock = threading.Lock()
 
     # —— 建库 ——
-    def _ensure_collection(self):
+    def _ensure_collection(self) -> None:
         if not self.client.collection_exists(self.cfg.collection_name):
             self.client.create_collection(
                 collection_name=self.cfg.collection_name,

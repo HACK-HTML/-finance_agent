@@ -3,19 +3,21 @@ FastAPI 服务 — 把 Agent 包装成 HTTP API
 提供：多会话管理 / 流式响应 / 会话历史查询 / 健康检查
 """
 
-import uuid
+import asyncio
+import json
 import os
 import shutil
-import asyncio
+import sys
 import tempfile
+import uuid
+from pathlib import Path
+from typing import Any
+
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-import json
 
 # 把项目根目录加入 Python 路径
-import sys
-from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from core.agent import FinanceAgent
@@ -95,7 +97,8 @@ class SessionInfo(BaseModel):
 # ── 路由 ──────────────────────────────────────────────────────────────────────
 
 @app.get("/", summary="服务健康检查")
-def root():
+def root() -> dict[str, Any]:
+    """返回服务状态和活跃会话数。"""
     return {
         "status": "✅ running",
         "agent": "Finance Assistant",
@@ -104,7 +107,7 @@ def root():
 
 
 @app.post("/chat", response_model=ChatResponse, summary="发送消息给 Agent")
-async def chat(req: ChatRequest, request: Request):
+async def chat(req: ChatRequest, request: Request) -> ChatResponse:
     """
     主要对话接口。
     - session_id 不传时自动创建新会话
@@ -135,7 +138,7 @@ async def chat(req: ChatRequest, request: Request):
 
 @app.post("/upload", summary="上传 PDF 文档进入指定用户的知识库")
 async def upload(request: Request, file: UploadFile = File(...), session_id: str | None = Form(None),
-                 user_id: str | None = Form(None)):
+                 user_id: str | None = Form(None)) -> dict[str, Any]:
     """
     用户上传 PDF → 切块 + 向量化 → 写入该用户的 Qdrant 知识库。
     同一 user_id 的文档在所有 session 中均可检索。
@@ -174,7 +177,7 @@ async def upload(request: Request, file: UploadFile = File(...), session_id: str
 
 
 @app.get("/session/{session_id}", response_model=SessionInfo, summary="查看会话详情")
-def get_session(session_id: str):
+def get_session(session_id: str) -> SessionInfo:
     """查看某个会话的完整对话历史和工具调用记录"""
     agent = sessions.get(session_id)
     if not agent:
@@ -195,7 +198,7 @@ def get_session(session_id: str):
 
 
 @app.delete("/session/{session_id}", summary="重置会话")
-def reset_session(session_id: str):
+def reset_session(session_id: str) -> dict[str, str]:
     """清空指定会话的对话历史"""
     if session_id in sessions:
         sessions[session_id].reset()
@@ -204,7 +207,8 @@ def reset_session(session_id: str):
 
 
 @app.get("/sessions", summary="列出所有活跃会话")
-def list_sessions():
+def list_sessions() -> dict[str, Any]:
+    """返回当前所有活跃会话的摘要列表。"""
     return {
         "count": len(sessions),
         "sessions": [
