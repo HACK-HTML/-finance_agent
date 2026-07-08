@@ -4,8 +4,8 @@ __pycache__/
 .claude
 storage
 course
-*.csv
-*.txt
+.env
+*.pyc
 *.bin
-*.md
-!README.md
+*计划*.md
+claude-code-docs.md

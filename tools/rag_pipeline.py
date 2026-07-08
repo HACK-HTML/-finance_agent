@@ -223,7 +223,10 @@ class DocumentStore:
 
     def __init__(self, config: Optional[RAGConfig] = None):
         self.cfg = config or RAGConfig()
-        if self.cfg.qdrant_location == ":memory:":
+        qdrant_url = os.getenv("QDRANT_URL", "")
+        if qdrant_url:
+            self.client = QdrantClient(url=qdrant_url)
+        elif self.cfg.qdrant_location == ":memory:":
             self.client = QdrantClient(location=":memory:")
         else:
             self.client = QdrantClient(path=self.cfg.qdrant_location)

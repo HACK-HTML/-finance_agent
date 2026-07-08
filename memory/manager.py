@@ -17,6 +17,7 @@ MemoryManager —— Mem0 跨会话记忆封装
 """
 from __future__ import annotations
 
+import os
 import threading
 
 
@@ -36,6 +37,22 @@ class MemoryManager:
             with self._lock:
                 if self._memory is None:
                     from mem0 import Memory
+
+                    # 支持远程 Qdrant（Docker 部署）或本地文件 Qdrant
+                    qdrant_url = os.getenv("MEM0_QDRANT_URL", "")
+                    vector_config: dict = {
+                        "collection_name": "user_memories",
+                        "embedding_model_dims": 512,
+                    }
+                    if qdrant_url:
+                        vector_config["url"] = qdrant_url
+                    else:
+                        vector_config["path"] = "./storage/mem0_qdrant"
+
+                    history_db = os.getenv(
+                        "MEM0_HISTORY_DB", "./storage/mem0_history.db",
+                    )
+
                     config = {
                         "llm": {
                             "provider": "deepseek",
@@ -52,13 +69,9 @@ class MemoryManager:
                         },
                         "vector_store": {
                             "provider": "qdrant",
-                            "config": {
-                                "collection_name": "user_memories",
-                                "path": "./storage/mem0_qdrant",
-                                "embedding_model_dims": 512,  # ← 加这行，覆盖 Mem0 默认的 1536
-                            },
+                            "config": vector_config,
                         },
-                        "history_db_path": "./storage/mem0_history.db",
+                        "history_db_path": history_db,
                     }
                     self._memory = Memory.from_config(config)
 

@@ -96,7 +96,7 @@ class SessionInfo(BaseModel):
 
 # ── 路由 ──────────────────────────────────────────────────────────────────────
 
-@app.get("/", summary="服务健康检查")
+@app.get("/", summary="服务首页")
 def root() -> dict[str, Any]:
     """返回服务状态和活跃会话数。"""
     return {
@@ -104,6 +104,15 @@ def root() -> dict[str, Any]:
         "agent": "Finance Assistant",
         "sessions_active": len(sessions),
     }
+
+
+@app.get("/health", summary="健康检查端点")
+def health() -> dict[str, str]:
+    """Docker 健康检查专用 —— 仅返回 200，不做任何外部依赖探测。
+
+    与 / 的区别：/ 会遍历 sessions 做摘要（可能慢），/health 是 O(1) 空操作。
+    """
+    return {"status": "healthy"}
 
 
 @app.post("/chat", response_model=ChatResponse, summary="发送消息给 Agent")
