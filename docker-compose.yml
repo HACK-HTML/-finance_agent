@@ -1,0 +1,104 @@
+version: "3.8"
+
+services:
+  # ── Qdrant 向量数据库 ──────────────────────────────────────────────────────
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: finance-qdrant
+    ports:
+      - "6333:6333"   # REST API（Python SDK 用这个）
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── 财务 Agent 应用 ────────────────────────────────────────────────────────
+  app:
+    build: .
+    container_name: finance-agent
+    ports:
+      - "8000:8000"
+    environment:
+      # ★ 必填：DeepSeek API Key（从宿主机环境变量传入）
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:?请在 .env 或环境中设置 DEEPSEEK_API_KEY}
+
+      # Qdrant 连接地址（服务名 "qdrant" 由 Docker DNS 解析）
+      - QDRANT_URL=http://qdrant:6333
+      - MEM0_QDRANT_URL=http://qdrant:6333
+
+      # Mem0 历史数据库路径（容器内持久化）
+      - MEM0_HISTORY_DB=/app/storage/mem0_history.db
+
+      # LangFuse 可观测性（可选，不配则自动跳过）
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-}
+
+      # Debug 模式（开发时设为 1 可看到完整消息历史）
+      - DEBUG=${DEBUG:-0}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      # 持久化：ONNX 模型缓存 + Mem0 SQLite 历史
+      - app_storage:/app/storage
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s  # 首次启动慢（下载 ONNX 模型），给足时间
+
+  # ── CLI 交互模式（profile: cli）───────────────────────────────────────────
+  # 用法：docker-compose --profile cli run --rm cli
+  cli:
+    build: .
+    container_name: finance-cli
+    profiles: ["cli"]          # ★ 默认不启动，加 --profile cli 才启动
+    stdin_open: true           # 保持 stdin 开启（交互输入）
+    tty: true                  # 分配伪终端（颜色输出 / 退格支持）
+    command: python main.py
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:?err}
+      - QDRANT_URL=http://qdrant:6333
+      - MEM0_QDRANT_URL=http://qdrant:6333
+      - MEM0_HISTORY_DB=/app/storage/mem0_history.db
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - app_storage:/app/storage
+
+  # ── CLI 演示模式（profile: cli）───────────────────────────────────────────
+  # 用法：docker-compose --profile cli run --rm cli-demo
+  cli-demo:
+    build: .
+    container_name: finance-cli-demo
+    profiles: ["cli"]          # ★ 和 cli 共享同一个 profile
+    command: python main.py --demo
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:?err}
+      - QDRANT_URL=http://qdrant:6333
+      - MEM0_QDRANT_URL=http://qdrant:6333
+      - MEM0_HISTORY_DB=/app/storage/mem0_history.db
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-}
+      - LANGFUSE_HOST=${LANGFUSE_HOST:-}
+    depends_on:
+      qdrant:
+        condition: service_healthy
+    volumes:
+      - app_storage:/app/storage
+
+# ── 命名卷（容器删除后数据保留）──────────────────────────────────────────────
+volumes:
+  qdrant_data:
+  app_storage:
